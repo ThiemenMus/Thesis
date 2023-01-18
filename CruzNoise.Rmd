@@ -1,0 +1,747 @@
+---
+title: "Untitled"
+output: html_document
+date: "2022-10-17"
+---
+
+
+```{r}
+library(matrixStats) #rowVars
+library(tidyverse)
+library(data.table) #fread
+```
+
+# FUNCTIONS
+```{r}
+#calculate stats sergio uses to estimate library size effect
+sergio_lsstats <- function(experiment) {
+  lsstats <- group_by(experiment, field) %>%
+    summarise(across(plant1:plant60, sum)) %>%
+    mutate(across(plant1:plant60, log)) %>%
+    pivot_longer(cols=c(-field), names_to='plant') %>%
+    group_by(field) %>%
+    summarise(ls_mean = mean(value), ls_sd = sd(value)) %>%
+    summarise(mean = mean(ls_mean), sd = mean(ls_sd))
+
+  return(lsstats)
+}
+
+
+#log2 transform all counts from a dataset
+tibble_logtransform <- function(experiment) {
+  experiment <- experiment %>%
+      mutate(across(plant1:plant60, ~ log2(.x + 1)))
+  return(experiment)
+}
+
+
+tibble_summarize <- function(experiment, which_stat, which_level) {
+  
+  if(which_stat=='ls') {
+    
+    ls_plant <- group_by(experiment, field) %>%
+      summarise(across(plant1:plant60, sum))
+    
+    if (which_level=='plant') {
+      return(ls_plant)
+      
+    } else if (which_level=='field') {
+      
+      ls_field <- ls_plant %>%
+        pivot_longer(cols=c(-field), names_to='plant') %>%
+        group_by(field) %>%
+        summarise(ls_mean = mean(value), ls_var = var(value))
+      
+      return(ls_field)
+    }
+    
+  } else if(which_stat=='zc') {
+    
+    zero_count <- function(variable) {
+      sub <- sum(variable==0) / length(variable)
+      return(sub)
+    }
+    
+    zc_plant <- group_by(experiment, field) %>%
+      summarise(across(plant1:plant60, zero_count))
+    
+    if(which_level=='plant') {
+      return(zc_plant)
+      
+    } else if (which_level=='field') {
+      
+      zc_field <- zc_plant %>%
+        pivot_longer(cols=c(-field), names_to='plant') %>%
+        group_by(field) %>%
+        summarise(zc_mean = mean(value), zc_var = var(value))
+      
+      return(zc_field)
+    }
+    
+  } else if(which_stat=='zg') {
+    
+    zg_gene <- experiment %>%
+      mutate(zg = rowSums(select(experiment, starts_with('plant')) == 0) / 60) %>%
+      relocate(zg, .after=1)
+    #summarized over plants
+    
+    if(which_level == 'gene') {
+      return(zg_gene)
+      
+    } else if(which_level=='field') {
+      
+      zg_field <- group_by(zg_gene, field) %>%
+        summarise(zg_mean = mean(zg), zg_var = var(zg)) #if 'zg_mean' is named 'zg', the var calculates on the new column somehow
+      
+      return(zg_field)
+    }
+    
+  } else if(which_stat=='ge') {
+    
+    ge_gene <- experiment %>%
+      rowwise() %>%
+      mutate(avgge = mean(c_across(plant1:plant60))) %>% mutate(varge = var(c_across(plant1:plant60))) %>%
+      #need to specify plant1:plant60 because the variance would also include the newly generated mean column!
+      relocate(c(avgge, varge), .after=1)
+    
+    if(which_level=='gene') {
+      return(ungroup(ge_gene))
+      
+    } else if (which_level=='field') {
+      
+      ge_field <- group_by(ge_gene, field) %>%
+        summarise(avgge_mean = mean(avgge), avgge_var = var(avgge), varge_mean = mean(varge), varge_var = var(varge))
+      
+      return(ge_field)
+    }
+  }
+}
+
+#with log-transformed library sizes and log2-tranformed counts to calc avgge & varge
+tibble_summarize_original <- function(experiment, which_stat, which_level) {
+  
+  if(which_stat=='ls') {
+    
+    logls_plant <- group_by(experiment, field) %>%
+      summarise(across(plant1:plant60, sum)) %>%
+      mutate(across(plant1:plant60, log))
+    
+    if (which_level=='plant') {
+      return(logls_plant)
+      
+    } else if (which_level=='field') {
+      
+      logls_field <- logls_plant %>%
+        pivot_longer(cols=c(-field), names_to='plant') %>%
+        group_by(field) %>%
+        summarise(ls_mean = mean(value), ls_var = var(value))
+      
+      return(logls_field)
+    }
+    
+  } else if(which_stat=='zc') {
+    
+    zero_count <- function(variable) {
+      sub <- sum(variable==0) / length(variable)
+      return(sub)
+    }
+    
+    zc_plant <- group_by(experiment, field) %>%
+      summarise(across(plant1:plant60, zero_count))
+    
+    if(which_level=='plant') {
+      return(zc_plant)
+      
+    } else if (which_level=='field') {
+      
+      zc_field <- zc_plant %>%
+        pivot_longer(cols=c(-field), names_to='plant') %>%
+        group_by(field) %>%
+        summarise(zc_mean = mean(value), zc_var = var(value))
+      
+      return(zc_field)
+    }
+    
+  } else if(which_stat=='zg') {
+    
+    zg_gene <- experiment %>%
+      mutate(zg = rowSums(select(experiment, starts_with('plant')) == 0) / 60) %>%
+      relocate(zg, .after=1)
+    #summarized over plants
+    
+    if(which_level == 'gene') {
+      return(zg_gene)
+      
+    } else if(which_level=='field') {
+      
+      zg_field <- group_by(zg_gene, field) %>%
+        summarise(zg_mean = mean(zg), zg_var = var(zg)) #if 'zg_mean' is named 'zg', the var calculates on the new column somehow
+      
+      return(zg_field)
+    }
+    
+  } else if(which_stat=='ge') {
+    
+    ge_gene <- experiment %>%
+      mutate(across(plant1:plant60, ~ log2(.x + 1))) %>% #logtranform counts
+      rowwise() %>% #groups per row, useful when a vectorised function doesn't exist
+      mutate(avgge = mean(c_across(plant1:plant60))) %>% mutate(varge = var(c_across(plant1:plant60))) %>%
+      #need to specify plant1:plant60 because the variance would also include the newly generated mean column!
+      relocate(c(avgge, varge), .after=1)
+    
+    if(which_level=='gene') {
+      return(ge_gene)
+      
+    } else if (which_level=='field') {
+      
+      ge_field <- group_by(ge_gene, field) %>%
+        summarise(avgge_mean = mean(avgge), avgge_var = var(avgge), varge_mean = mean(varge), varge_var = var(varge))
+      
+      return(ge_field)
+    }
+  }
+}
+
+tibble_fieldstats <- function(experiment) {
+  fieldstats <- purrr::reduce(list(tibble_summarize(experiment, 'ls', 'field'),
+                                   tibble_summarize(experiment, 'zc', 'field'), 
+                                   tibble_summarize(experiment, 'zg', 'field'),
+                                   tibble_summarize(experiment, 'ge', 'field')),
+                              dplyr::left_join, by='field')
+}
+
+tibble_expstats <- function(fieldstats) {
+  expstats <- fieldstats %>%
+  summarise(ls = mean(ls_mean),
+            ls_avgvar = mean(ls_var),
+            zc = mean(zc_mean),
+            zc_avgvar = mean(zc_var),
+            zg = mean(zg_mean),
+            zg_avgvar = mean(zg_var),
+            avgge = mean(avgge_mean),
+            avgge_avgvar = mean(avgge_var),
+            varge = mean(varge_mean),
+            varge_avgvar = mean(varge_var)
+            )
+}
+
+load_exp <- function(expr_path) {
+  filenames <- list.files(expr_path, pattern='*.csv', full.names=TRUE)
+  exp_list <- lapply(filenames, fread) %>%
+    lapply(as_tibble)
+  
+  for (i in 1:length(exp_list)) {
+    if (i == 1) {
+      samples <- exp_list[[1]] %>%
+        mutate(field = 1)
+    } else {
+      sub <- mutate(exp_list[[i]], field = i)
+      samples <- rbind(samples, sub)
+    }
+  }
+  samples <- relocate(samples, field, .before=1)
+  colnames(samples) <- c('field', sprintf('plant%s', 1:(ncol(samples) - 1)))
+  
+  return(samples)
+}
+
+boxplot_merge <- function(tibble_list, colnames_vector, which_stat, which_level) {
+  
+  for (i in 1:length(tibble_list)) {
+    
+    sub <- tibble_summarize(tibble_list[[i]], which_stat, which_level)
+    
+    if(which_level=='plant') {
+      
+      sub <- sub %>%
+        pivot_longer(cols=c(-field), names_to='plant', values_to=which_stat) %>%
+        select(field, which_stat)
+      
+    } else if (which_level=='gene') {
+      
+      sub <- sub %>%
+        select(1, 2, 3)
+    }
+    
+    sub <- mutate(sub, exp=colnames_vector[i])
+    
+    if (i == 1) {
+      merged <- sub
+    } else {
+      merged <- as_tibble(rbind(merged, sub))
+    }
+  }
+  merged <- relocate(merged, exp, .before=1)
+  return(merged)
+}
+```
+
+
+
+# Sampling Real Dataset
+
+```{r}
+sample_from_cruz <- function(n_genes, n_fields) {
+  
+  cruz_expr <- fread(file='Cruz data/E-MTAB-8944.processed.1/raw_60_counts_V3_JoinedNames.tsv')
+  cruz_expr <- as_tibble(cruz_expr)
+  #fread to work around tibble not working with row names
+  
+  colnames(cruz_expr) <- c('gene', sprintf('plant%s',1:60))
+  
+  #As Cruz et al. remove all genes that do not have at least 5 cpm in 1 plant.
+  cruz_expr <- cruz_expr[-1]
+  cruz_cpm <- cruz_expr / (colSums(cruz_expr)/10^6)
+  cruz_expr <- cruz_expr[rowSums(cruz_cpm >= 5) > 0, ]
+  
+  #SAMPLING 5 FIELDS with n genes
+  for (i in 1:n_fields) {
+    if (i == 1) {
+      cruz_samples <- slice_sample(cruz_expr, n = n_genes) %>%
+        mutate(field = 1) %>%
+        relocate(field, .before = 1)
+    } else {
+      cruz_samples <- slice_sample(cruz_expr, n = n_genes) %>%
+        mutate(field = i) %>%
+        relocate(field, .before = 1) %>%
+        bind_rows(cruz_samples)
+    }
+  }
+  cruz_samples <- arrange(cruz_samples, field)
+  #tibble with n_fields * n_genes observations and 60 plants + field -> 61 variables
+  return(cruz_samples)
+}
+```
+
+```{r}
+### Estimate library size effect for sergio
+sergio_lsstats(cruz_samples)
+```
+
+
+```{r}
+#LIBRARY SIZE
+#############
+cruz_ls_plant <- group_by(cruz_samples, field) %>%
+  summarise(across(plant1:plant60, sum))
+#summarized over genes: 60*n_field ls values
+
+cruz_ls_field <- cruz_ls_plant %>%
+  pivot_longer(cols=c(-field), names_to='plant') %>%
+  group_by(field) %>%
+  summarise(ls_mean = mean(value), ls_var = var(value))
+#summarized over plants: 60 ls values 
+  
+#ZERO COUNT PER CELL
+###################
+zero_count <- function(variable) {
+  sub <- sum(variable==0) / length(variable)
+  return(sub)
+}
+cruz_zc_plant <- group_by(cruz_samples, field) %>%
+  summarise(across(plant1:plant60, zero_count))
+cruz_zc_field <- cruz_zc_plant %>%
+  pivot_longer(cols=c(-field), names_to='plant') %>%
+  group_by(field) %>%
+  summarise(zc_mean = mean(value), zc_var = var(value))
+
+#ZERO COUNT PER GENE
+####################
+cruz_zg_gene <- cruz_samples %>%
+  mutate(zg = rowSums(select(cruz_samples, starts_with('plant')) == 0) / 60) %>%
+  relocate(zg, .after=1)
+#summarized over plants
+cruz_zg_field <- group_by(cruz_zg_gene, field) %>%
+  summarise(zg_mean = mean(zg), zg_var = var(zg)) #if 'zg_mean' is named 'zg', the var calculates on the new column somehow
+
+#AVERAGE GENE EXPRESSION & EXPRESSION VARIANCE
+###################################
+cruz_ge_gene <- cruz_samples %>%
+  rowwise() %>% #groups per row, useful when a vectorised function doesn't exist
+  mutate(avgge = mean(c_across(plant1:plant60))) %>% mutate(varge = var(c_across(plant1:plant60))) %>%
+  #need to specify plant1:plant60 because the variance would also include the newly generated mean column!
+  relocate(c(avgge, varge), .after=1)
+cruz_ge_field <- group_by(cruz_ge_gene, field) %>%
+  summarise(avgge_mean = mean(avgge), avgge_var = var(avgge), varge_mean = mean(varge), varge_var = var(varge))
+
+(cruz_fieldstats <- purrr::reduce(list(cruz_ls_field,cruz_zc_field,
+                                      cruz_zg_field, cruz_ge_field), dplyr::left_join, by = 'field'))
+
+cruz_expstats <- cruz_fieldstats %>%
+  summarise(ls = mean(ls_mean),
+            ls_avgvar = mean(ls_var),
+            zc = mean(zc_mean),
+            zc_avgvar = mean(zc_var),
+            zg = mean(zg_mean),
+            zg_avgvar = mean(zg_var),
+            avgge = mean(avgge_mean),
+            avgge_avgvar = mean(avgge_var),
+            varge = mean(varge_mean),
+            varge_avgvar = mean(varge_var))
+```
+
+
+# ANALYSIS
+## 100g
+
+### COMPARING STATISTICS
+"""
+clean
+"""
+```{r}
+### Cruz sampling
+cruz1g_samples <- sample_from_cruz(100, 5)
+cruz1g_fs <- tibble_fieldstats(cruz1g_samples)
+cruz1g_es <- tibble_expstats(cruz1g_fs)
+
+c1g_samples <- load_exp('sergio_output/100g/clean')
+c1g_fs <- tibble_fieldstats(c1g_samples)
+c1g_es <- tibble_expstats(c1g_fs)
+```
+
+```{r}
+#### Distributions
+c1g_cruz_merged <- boxplot_merge(list(c1g_samples, cruz1g_samples), c('clean', 'cruz'), 'ge', 'gene') %>%
+  mutate(across(avgge:varge, log2))
+c1g_cruz_merged$field <- as.character(c1g_cruz_merged$field)
+c1g_cruz_merged$field <- factor(c1g_cruz_merged$field, levels=c("1", "2", "3", "4", "5"))
+
+ggplot(c1g_cruz_merged, aes(x=field, y=avgge)) +
+  geom_boxplot() +
+  ggtitle("First look") +
+  xlab("Field") + ylab("Average gene expression (log2)") +
+  facet_wrap(~exp)
+
+rbind(cruz1g_es, c1g_es)
+
+sergio_lsstats(cruz1g_samples)
+```
+
+#### trial and error
+"""
+dirty 1: adjusted library effect only
+"""
+```{r}
+dirty1_samples <- load_exp('sergio_output/100g/dirty_1')
+dirty1_fieldstats <- tibble_fieldstats(dirty1_samples)
+dirty1_expstats <- tibble_expstats(dirty1_fieldstats)
+
+rbind(cruz1g_es, dirty1_expstats)
+#there is more difference between genes and more difference between plants in the real dataset. Try adding some outliers.
+
+#Maybe the counts should be log2 transformed before comparison of statistics. Ls vs zc & zg vs avgge & varge are all on a different scale.
+#it doesn't make sense to compare library sizes of log2-transformed counts. the log of a sum is not the same as the sum of logs. Zero counts don't make sense either. We don't log-transform, outliers might be easier to compare this way and all stats will be on the same scale. We don't plan to fit a model on the counts either.
+
+```
+
+```{r}
+### Distribution
+d1_cruz_merged <- boxplot_merge(list(c1g_samples, dirty1_samples, cruz1g_samples), c('clean', 'dirty', 'cruz'), 'ge', 'gene') %>%
+  mutate(across(avgge:varge, log2))
+d1_cruz_merged$field <- as.character(d1_cruz_merged$field)
+d1_cruz_merged$field <- factor(d1_cruz_merged$field, levels=c("1", "2", "3", "4", "5"))
+
+ggplot(d1_cruz_merged, aes(x=field, y=avgge)) +
+  geom_boxplot() +
+  facet_wrap(~exp)
+
+```
+
+
+"""
+dirty 2: lib 11.32 s 0.32, out 0.01 0.8 1
+"""
+```{r}
+dirty2_samples <- load_exp('sergio_output/dirty_2')
+dirty2_fieldstats <- tibble_fieldstats(dirty2_samples)
+dirty2_expstats <- tibble_expstats(dirty2_fieldstats)
+
+rbind(dirty1_expstats, dirty2_expstats)
+#Outlier genes seem to mainly have effect on the variance in average gene expression between genes
+
+rbind(cruz_expstats, dirty2_expstats)
+#Try a bit lower library size effect and more outliers
+
+#Aren't we masking biological variation by tweaking the variance of average gene expression between genes? These could be genes that are simply more highly expressed in the GRN of the real data than in sergio's GRN.
+#Variation between plants most likely is just noise though.
+```
+
+"""
+dirty 3: lib 11.3 s 0.3 out 0.05 1 1
+"""
+```{r}
+dirty3_samples <- load_exp('sergio_output/dirty_3')
+dirty3_fieldstats <- tibble_fieldstats(dirty3_samples)
+dirty3_expstats <- tibble_expstats(dirty3_fieldstats)
+
+rbind(dirty2_expstats, dirty3_expstats)
+
+rbind(cruz_expstats, dirty3_expstats)
+
+# no effect of more outliers on the variance of gene expression
+# Maybe using the hill coefficients of the GRN will result in more expression variance between and within genes ==> delete shared_coop_state==2
+# Doesn't matter after closer inspection (see notes). Trying higher shared_coop_state (3)
+```
+
+"""
+dirty 4: shared_coop_state=3
+"""
+```{r}
+dirty4_samples <- load_exp('sergio_output/dirty_4')
+dirty4_fieldstats <- tibble_fieldstats(dirty4_samples)
+dirty4_expstats <- tibble_expstats(dirty4_fieldstats)
+
+rbind(dirty2_expstats, dirty4_expstats)
+
+rbind(cruz_expstats, dirty4_expstats)
+
+#There is higher variance between and within genes, yet not enough still. Maybe looking at the distributions on a log2-scale makes more sense though.
+```
+
+### COMPARING DISTRIBUTIONS
+
+```{r}
+# Testing boxplot_merge function
+rofl <- boxplot_merge(list(clean_samples, cruz_samples, dirty2_samples), c('clean', 'cruz', 'dirty1'), 'ge', 'gene') %>%
+  mutate(across(avgge:varge, log2))
+
+ggplot(rofl, aes(x=field, y=avgge, group=field)) +
+  geom_boxplot() +
+  facet_wrap(~exp)
+
+xd <- boxplot_merge(list(clean_samples, cruz_samples, dirty2_samples), c('clean', 'cruz', 'dirty1'), 'ge', 'gene')
+ggplot(xd, aes(x=field, y=avgge, group=field)) +
+  geom_boxplot() +
+  facet_wrap(~exp)
+```
+#### trial and error
+"""
+plots dirty2
+"""
+```{r}
+dirty2_plot <- boxplot_merge(list(clean_samples, cruz_samples, dirty2_samples), c('clean', 'cruz', 'dirty2'), 'ge', 'gene') %>%
+  mutate(across(avgge:varge, log2))
+
+ggplot(dirty2_plot, aes(x=field, y=avgge, group=field)) +
+  geom_boxplot() +
+  facet_wrap(~exp)
+
+dirty_plot <- boxplot_merge(list(dirty1_samples, dirty2_samples), c('dirty1', 'dirty2'), 'ge', 'gene') %>%
+  mutate(across(avgge:varge, log2))
+
+ggplot(dirty_plot, aes(x=field, y=avgge, group=field)) +
+  geom_boxplot() +
+  facet_wrap(~exp)
+```
+
+""" 
+plots dirty5: out 0.2 2 1.5
+"""
+```{r}
+dirty5_samples <- load_exp('dirty_5')
+dirty5_fieldstats <- tibble_fieldstats(dirty5_samples)
+dirty5_expstats <- tibble_expstats(dirty5_fieldstats)
+
+rbind(cruz_expstats, dirty5_expstats)
+rbind(dirty1_expstats, dirty5_expstats)
+#variances way closer together
+
+dirty5_plot <- boxplot_merge(list(clean_samples, cruz_samples, dirty5_samples), c('clean', 'cruz', 'dirty'), 'ge', 'gene') %>%
+  mutate(across(avgge:varge, log2))
+
+ggplot(dirty5_plot, aes(x=field, y=avgge, group=field)) +
+  geom_boxplot() +
+  facet_wrap(~exp)
+ggplot(dirty5_plot, aes(x=field, y=varge, group=field)) +
+  geom_boxplot() +
+  facet_wrap(~exp)
+#extreme values are more alike but less well spread. Try higher chance for outliers to spread the variance more evenly? 100% chance of outlier?
+
+
+```
+#### BEST RESULT
+"""
+dirty6: out 1 2 1.5
+"""
+```{r}
+d1g6_samples <- load_exp('sergio_output/100g/dirty_6')
+d1g6_fs <- tibble_fieldstats(d1g6_samples)
+d1g6_es <- tibble_expstats(d1g6_fs)
+
+rbind(cruz1g_es, d1g6_es)
+
+g1_ge_merge <- boxplot_merge(list(c1g_samples, cruz1g_samples, d1g6_samples), c('clean', 'cruz', 'dirty'), 'ge', 'gene') %>%
+  mutate(across(avgge:varge, log2))
+
+ggplot(g1_ge_merge, aes(x=field, y=avgge, group=field)) +
+  geom_boxplot() +
+  ggtitle("Adjusted for outlier genes") +
+  xlab("Field") + ylab("Average gene expression (log2)") +
+  facet_wrap(~exp)
+ggplot(g1_ge_merge, aes(x=field, y=varge, group=field)) +
+  geom_boxplot() +
+  xlab("Field") + ylab("Variance of gene expression (log2)") +
+  facet_wrap(~exp)
+#amazing resemblance between distributions, but is it fine to abuse the outlier parameter like this...?
+
+dirty6_ls <- tibble_summarize(d1g6_samples, 'ls', 'plant') %>%
+  pivot_longer(cols=c(-field), names_to='plant', values_to='ls') %>%
+  select(field, ls)
+dirty6_plot_ls <- boxplot_merge(list(c1g_samples, cruz1g_samples, d1g6_samples), c('clean', 'cruz', 'dirty'), 'ls', 'plant')
+
+ggplot(dirty6_plot_ls, aes(x=field, y=ls, group=field)) +
+  geom_boxplot() +
+  facet_wrap(~exp)
+#there seems to be more variance between genes in the real data
+
+dirty6_zc <- boxplot_merge(list(clean_samples, cruz_samples, dirty6_samples), c('clean', 'cruz', 'dirty'), 'zc', 'plant')
+ggplot(dirty6_zc, aes(x=field, y=zc, group=field)) +
+  geom_boxplot() +
+  facet_wrap(~exp)
+```
+
+
+## 400g
+### statistics
+```{r}
+cruz4g_samples <- sample_from_cruz(400, 5)
+
+cruz4g_fs <- tibble_fieldstats(cruz4g_samples)
+cruz4g_es <- tibble_expstats(cruz4g_fs)
+
+sergio_lsstats(cruz4g_samples)
+```
+
+""" 
+clean
+"""
+```{r}
+c4_samples <- load_exp('sergio_output/400g/clean')
+
+c4_fs <- tibble_fieldstats(c4_samples)
+c4_es <- tibble_expstats(c4_fs)
+
+rbind(cruz4g_es, c4_es)
+#expected results looking at 100g clean vs cruz
+```
+"""
+dirty1: ls mean 12.7 sd 0.3
+"""
+```{r}
+d41_samples <- load_exp('sergio_output/400g/dirty1')
+
+d41_fs <- tibble_fieldstats(d41_samples)
+d41_es <- tibble_expstats(d41_fs)
+
+rbind(cruz_es, d41_es)
+#expected results, needs more variance between genes and between plants
+```
+"""
+dirty2: ls mean 12.7 sd 0.3 outliers p 1 mean 2 scale 1.5
+"""
+```{r}
+d42_samples <- load_exp('sergio_output/400g/dirty2')
+
+d42_fs <- tibble_fieldstats(d42_samples)
+d42_es <- tibble_expstats(d42_fs)
+
+rbind(cruz4g_es, d42_es)
+#relatively comparable variances, comparing distributions below
+```
+
+dirty3 (after 1200g): ls 12.7 sd 0.3 out 1 3 3 
+```{r}
+d4g3_samples <- load_exp('sergio_output/400g/dirty3')
+d4g3_es <- tibble_expstats(tibble_fieldstats(d4g3_samples))
+rbind(cruz4g_es, d4g3_es)
+
+#too much zero's
+
+ge_merge_4g3 <- boxplot_merge(list(c4_samples, cruz4g_samples, d4g3_samples), c('clean', 'cruz', 'dirty'), 'ge', 'gene') %>%
+  mutate(across(avgge:varge, log2))
+ggplot(ge_merge_4g3, aes(x=field, y=avgge, group=field)) +
+  geom_boxplot() +
+  facet_wrap(~exp)
+ggplot(ge_merge_4g3, aes(x=field, y=varge, group=field)) +
+  geom_boxplot() +
+  facet_wrap(~exp)
+
+#Note that the real data had a lot of zero values processed out ==> genes with lower values and thus lower variances filtered. It makes sense that the variance is right-skewed because of this. Let's thus leave the used values as is: out 1 2 1.5
+```
+
+### boxplots
+```{r}
+d4_ge_merge <- boxplot_merge(list(c4_samples, cruz4g_samples, d42_samples), c('clean', 'cruz', 'dirty'), 'ge', 'gene') %>%
+  mutate(across(avgge:varge, log2))
+
+ggplot(d4_ge_merge, aes(x=field, y=avgge, group=field)) +
+  geom_boxplot() +
+  ggtitle("400 Genes") +
+  xlab("Field") + ylab("Average gene expression (log2)") +
+  facet_wrap(~exp)
+ggplot(d4_ge_merge, aes(x=field, y=varge, group=field)) +
+  geom_boxplot() +
+  ggtitle("400 Genes") +
+  xlab("Field") + ylab("Variance of gene expression (log2)") +
+  facet_wrap(~exp)
+#relatively comparable distributions, although the variance between plants has significantly shorter whiskers on the lower side, the variance is more right skewed.
+```
+
+## 1200g
+```{r}
+cruz12g_samples <- sample_from_cruz(1200, 5)
+cruz12g_samples
+
+cruz12g_fs <- tibble_fieldstats(cruz12g_samples)
+cruz12g_es <- tibble_expstats(cruz12g_fs)
+
+sergio_lsstats(cruz12g_samples) #13.8 0.3
+```
+```{r}
+c12g_samples <- load_exp('sergio_output/1200g/clean')
+
+c12g_fs <- tibble_fieldstats(c12g_samples)
+c12g_es <- tibble_expstats(c12g_fs)
+```
+
+### dirty1: lib 13.8 0.3 out 1 2 1.5
+```{r}
+d12g1_samples <- load_exp('sergio_output/1200g/dirty1')
+d12g1_samples
+
+d12g1_fs <- tibble_fieldstats(d12g1_samples)
+d12g1_es <- tibble_expstats(d12g1_fs)
+
+rbind(cruz12g_es, d12g1_es)
+#relatively equal variances, simulation variance is slightly lower
+```
+
+### dirty2: out 1 2 4
+```{r}
+d12g2_samples <- load_exp('sergio_output/1200g/dirty2')
+d12g2_fs <- tibble_fieldstats(d12g2_samples)
+d12g2_es <- tibble_expstats(d12g2_fs)
+
+rbind(cruz12g_es, d12g2_es)
+# too much zero's, scale can't be this high with a low mean. Higher mean lower scale? Try this on 400g
+```
+
+```{r}
+g12_ge_merge <- boxplot_merge(list(c12g_samples, cruz12g_samples, d12g1_samples), c('clean', 'cruz', 'dirty'), 'ge', 'gene') %>%
+  mutate(across(avgge:varge, log2))
+
+ggplot(g12_ge_merge, aes(x=field, y=avgge, group=field)) +
+  geom_boxplot() +
+  ggtitle("1200 Genes") +
+  xlab("Field") + ylab("Average gene expression (log2)") +
+  facet_wrap(~exp)
+ggplot(g12_ge_merge, aes(x=field, y=varge, group=field)) +
+  geom_boxplot() +
+  ggtitle("1200 Genes") +
+  xlab("Field") + ylab("Variance of gene expression (log2)") +
+  facet_wrap(~exp)
+#variances of cruz data are way more right skewed. Maybe use higher scale? -> No.
+```
+
+
+
