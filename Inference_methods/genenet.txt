@@ -1,0 +1,4 @@
+module load R/x86_64/4.1.3
+Rscript genenet.R $NSLOTS
+echo "Finished!"
+exit 0
