@@ -1,0 +1,1931 @@
+---
+title: "Analysis infmethods"
+output: html_document
+date: "2022-08-01"
+---
+
+```{r message=FALSE}
+library(tidyverse)
+library(data.table)
+library(gridExtra)
+library(pcalg)
+library(GeneNet)
+library(bc3net)
+library(GENIE3)
+#library(testit)
+#library(fitdistrplus)
+#library(qvalue)
+#library(abind)
+#library(ggpubr)
+```
+
+The true GRN only contains directed edges, 
+yet some inference methods return undirected edges.
+
+We first look at the performance of undirected edges, therefore directed edges are handled as if they were undirected.
+When an edge is present in both directions, it is converted to one undirected edge.
+- PC returns both directed and undirected edges
+- bc3 returns undirected edges
+- genenet returns undirected edges or directed edges if asked for
+- genie returns directed edges
+
+# X. Functions
+## X I. Basic functions
+```{r}
+### Read in true GRN file from SERGIO ###
+#########################################
+
+read_grn <- function(interaction_file, n_genes) {
+  
+  grn_txt <- read.delim(interaction_file, header=FALSE)
+  # 'input_file_taregts' file containing GRN structure and its parameters. for legend, cfr. https://github.com/PayamDiba/SERGIO
+  
+  
+  ### Extracting edges from interaction file ###
+  
+  grn_edges <- data.frame(matrix(ncol=2,nrow=0, dimnames=list(NULL, c("reg", "target"))))
+  count <- 0 
+  #count number of regulators in GRN as affirmation that number of edges is correct
+  
+  for (i in seq(grn_txt[,1])) {
+    #iterate over each target gene in the GRN
+    gene_row <- as.integer(unlist(strsplit(grn_txt[i,], ','))) 
+    #extract info of target gene i
+    n_regs <- gene_row[2]
+    count <- count + gene_row[2]
+    
+    for (j in seq(n_regs)) {  
+      # iterate over each regulator of the target gene,
+      # adding both to the final dataframe as an edge
+      df <- data.frame(gene_row[2 + j] + 1, gene_row[1] + 1)
+      # '+ 1' to adjust for the 0-index naming of the genes
+      grn_edges <- rbind(grn_edges, setNames(df, names(grn_edges)))
+    }
+  }
+  control1 <- count == nrow(grn_edges)
+  #control whether all edges have been added to the data frame
+  
+  ### Control for cyclic edges, which should not be present.
+  cyclic <- 0
+  for (i in seq(nrow(grn_edges))) {
+    edge_to_find <- data.frame(reg=grn_edges[[i, 2]], target=grn_edges[[i, 1]])
+    if (nrow(merge(edge_to_find, grn_edges)) > 0) {
+      count <- count + 1
+    }
+  }
+  control2 <- cyclic == 0
+  
+  ### Control for presence of n genes in the GRN
+  both <- list()
+  for (i in grn_edges["reg"]) {both <- append(both, i)}
+  for (i in grn_edges["target"]) {both <- append(both, i)}
+  
+  control3 <- length(unique(both)) == n_genes
+  
+  cat('all edges extracted:', control1, '\n') 
+  cat('no cyclic edges:', control2, '\n')
+  cat(sprintf('%s genes present in GRN:', n_genes), control3)
+  
+  grn_edges <- as_tibble(grn_edges) %>%
+    mutate(reg = as.character(reg), target = as.character(target))
+  return(as_tibble(grn_edges))
+}
+
+
+### Reading folder of R objects ###
+###################################
+
+### load folder of RData ###
+load_rdata <- function(folder) {
+  filenames <- dir(folder)
+  for (i in filenames) {
+    load(sprintf('%s/%s', folder, i), envir=.GlobalEnv)
+  }
+}
+
+### load folder of rds objects ###
+load_rds <- function(folder) {
+  
+  filenames <- dir(folder)
+  for (i in filenames) {
+    results <- str_replace(i, ".rds", "")
+    sub <- readRDS(sprintf('%s/%s', folder, i))
+    assign(results, sub)
+  }
+}
+
+### inference results to GRN ###
+################################
+
+### PC result to GRN
+pc_to_grn <- function(inf_out) {
+  
+  grn <- tribble(~reg, ~target, ~p, ~directed)
+  p_vals <- inf_out@pMax
+  adj <- summary(inf_out)
+  
+  for (i in 1:nrow(adj)) {
+    targets_of_i <- which(adj[i,-(1:i)] == 1) + i # + 1 to offset the lowered indices because of subsetting
+    regs_of_i <- which(adj[-(1:i),i] == 1) + i
+    sect <- intersect(targets_of_i, regs_of_i)
+    
+    if (length(sect) > 0) {
+      targets_of_i <- targets_of_i[!(targets_of_i %in% sect)]
+      regs_of_i <- regs_of_i[!(regs_of_i %in% sect)]
+    }
+    
+    for (target in targets_of_i) {
+      grn <- add_row(grn, reg=i, target=target, p=p_vals[i, target], directed=TRUE)
+    }
+    for (reg in regs_of_i) {
+      grn <- add_row(grn, reg=reg, target=i, p=p_vals[reg, i], directed=TRUE)
+    }
+    for (node in sect) {
+      grn <- add_row(grn, reg=i, target=node, p=p_vals[i, node], directed=FALSE)
+    }
+  }
+  grn <- mutate(grn, method='pc', reg = as.character(reg), target = as.character(target))
+  return(grn)
+}
+
+### bc3 result to GRN
+bc3_to_grn <- function(inf_out) {
+  
+  grn <- as_edgelist(inf_out)
+  
+  if (length(grn) > 0) {
+    grn <- as_tibble(grn) %>%
+    mutate(weight=E(inf_out)$weight, directed=FALSE, method='bc3') %>%
+    arrange(desc(weight)) %>%
+    rename(reg = V1, target = V2)
+    return(grn)
+  } else {
+    return(NA)
+  }
+}
+
+### gn result to GRN
+gn_to_grn <- function(inf_out) {
+  
+  if (nrow(inf_out) == 0) {
+    return(NA)
+  }
+  
+  grn <- as_tibble(inf_out) %>%
+    dplyr::select(node1, node2, pval) %>%
+    rename(reg = node1, target = node2) %>% #does genenet return directed edges? Not by default!
+    mutate(directed = FALSE, method='gn', reg = as.character(reg), target = as.character(target))
+  
+  return(grn)
+}
+
+### genie result to GRN: only keeping the highest weight edge of both options.
+genie_to_grn <- function(inf_out, size=FALSE) {
+  if (size) {
+    inf_out <- inf_out[1:size,]
+  }
+  grn <- inf_out %>%
+    mutate(edge_key = case_when(reg < target ~paste(reg, target, sep='_'),
+                                reg > target ~paste(target, reg, sep='_'))) %>%
+    arrange(edge_key) %>%
+    distinct(edge_key, .keep_all=TRUE) %>%
+    dplyr::select(reg, target, weight) %>%
+    arrange(desc(weight))%>%
+    mutate(directed = TRUE, method='genie', reg=as.character(reg), target=as.character(target))
+  
+  return(grn)
+}
+    
+### inference results to GRNs ###
+inf_to_grns <- function(inf_results, size=FALSE) {
+  
+  results_class <- class(inf_results[[1]])
+  if (length(results_class) > 1) {
+    results_class <- results_class[1]
+  }
+                          
+  n_sims <- length(inf_results)
+  grn_list <- vector("list", n_sims)
+  
+  ### PC
+  if (results_class == 'pcAlgo') {
+    print('PC')
+    for (i in 1:n_sims) {
+      grn_list[[i]] <- pc_to_grn(inf_results[[i]])
+      if (i %in% seq(0, n_sims, 10)) {
+        print(paste(i, "% has been processed"))
+      }
+    }
+  }
+  ### bc3
+  else if (results_class == 'igraph') {
+    print('bc3')
+    for (i in 1:n_sims) {
+      grn_list[[i]] <- bc3_to_grn(inf_results[[i]])
+      if (i %in% seq(0, n_sims, 10)) {
+        print(paste(i, "% has been processed"))
+      }
+    }
+  }
+  ### genenet
+  else if (results_class == 'data.frame') {
+    print('genenet')
+    for (i in 1:n_sims) {
+      grn_list[[i]] <- gn_to_grn(inf_results[[i]])
+      if (i %in% seq(0, n_sims, 10)) {
+        print(paste(i, "% has been processed"))
+      }
+    }
+  }
+  ### Genie : delete directed edges with lowest weight
+  else if (is(inf_results[[1]], "tbl_df")) {
+    print('genie')
+    for (i in 1:n_sims) {
+      grn_list[[i]] <- genie_to_grn(inf_results[[i]], size=size)
+      if (i %in% seq(0, n_sims, 10)) {
+        print(paste(i, "% has been processed"))
+      }
+    }
+  }
+  else {
+    print('No valid object class')
+  }
+  return(grn_list)
+}
+
+### Summarizing statistics of interest per list of GRNs ###
+##################################################
+
+### Precision and recall ###
+
+summarise_grn <- function(fake_grn, true_grn, true_grn_inverse=FALSE) {
+  
+  if (is(true_grn_inverse, 'logical')) {
+    true_grn_inverse <- mutate(true_grn, reg2 = target, target2 = reg) %>%
+      select(reg2, target2) %>%
+      rename(reg=reg2, target=target2)
+  }
+  
+  if (is(fake_grn, 'logical')) {
+    
+    stats <- tribble(~prec, ~rec, ~TP, ~PP, 0, 0, 0, 0)
+    
+  } else {
+    
+    TP <- nrow(inner_join(fake_grn, true_grn)) + nrow(inner_join(fake_grn, true_grn_inverse))
+    PP <- nrow(fake_grn) # Proposed positives = TP + FP
+    prec <- TP / PP
+    rec <- TP / nrow(true_grn) # nrow(true_grn) = TP + FN (all positives)
+    
+    stats <- tribble(~prec, ~rec, ~TP, ~PP, prec, rec, TP, PP)
+  }
+  
+  return(stats) 
+  
+}
+
+### list of GRNs to statistics ###
+
+grns_to_stats <- function(grn_list, true_grn) {
+  
+  stats <- tribble(~precision, ~recall, ~TP, ~PP)
+  true_grn_inverse <- mutate(true_grn, reg2 = target, target2 = reg) %>%
+    select(reg2, target2) %>%
+    rename(reg=reg2, target=target2)
+  
+  if (is(grn_list[[1]], 'logical')) {
+    i <- 2
+    method <- NA
+    while(is.na(method) & i <= length(grn_list)) {
+      if (is(grn_list[[i]], 'logical')) {
+        i <- i + 1
+      } else {
+        method <- grn_list[[i]]$method[1]
+      }
+    }
+    if (i > length(grn_list)) {
+      print('No results found')
+      return(NA)
+    }
+  } else {
+    method <- grn_list[[1]]$method[1]
+  }
+  
+  
+  for (i in 1:length(grn_list)) {
+    
+    fake_grn <- grn_list[[i]]
+    stats <- rbind(stats, summarise_grn(fake_grn, true_grn, true_grn_inverse=true_grn_inverse))
+    
+    cat(sprintf('%s/%s\r', i, length(grn_list)))
+  }
+  
+  stats <- mutate(stats, method = method)
+  return(stats)
+}
+
+
+### ranked precision of list of GRNs ###
+########################################
+grns_to_rankprec <- function(grn_list, true_grn) {
+  grn_rank <- tribble(~reg, ~target, ~weight, ~directed, ~method, ~rank)
+  ### add rank and concatenate all grns
+  for (i in 1:length(grn_list)) {
+    if (!(is(grn_list[[i]], 'logical'))) {
+      grn_list[[i]] <- mutate(grn_list[[i]], rank = 1:nrow(grn_list[[i]]))
+      grn_rank <- rbind(grn_rank, grn_list[[i]])
+    }
+  }
+  grn_rank <- arrange(grn_rank, rank)
+  
+  ### add 1 for TP 0 for FP
+  true_regs <- true_grn$reg; fake_regs <- grn_rank$reg
+  true_targets <- true_grn$target; fake_targets <- grn_rank$target
+  TPs <- c()
+  for (i in 1:nrow(true_grn)) {
+    curr_reg <- true_regs[i]
+    curr_target <- true_targets[i]
+    TPs <- c(TPs, which(fake_regs == curr_reg & fake_targets == curr_target))
+    TPs <- c(TPs, which(fake_regs == curr_target & fake_targets == curr_reg))
+  }
+  
+  grn_rank <- mutate(grn_rank, TP = 0)
+  for (i in TPs) {
+    grn_rank[i, 'TP'] = 1
+  }
+  grn_rankprec <- group_by(grn_rank, rank) %>%
+    summarise(rank_precision=sum(TP)/100, rank_precision_adj=sum(TP)/(sum(rank) / mean(rank)), count = sum(rank) / mean(rank))
+  
+  return(list(grn_rank, grn_rankprec))
+}
+
+### Plotting ###
+plot_rankprec <- function(m1, m2, m3, m4, exp_precision) {
+  
+  ### Ranked Precision
+  plot1 <- ggplot(m1[[2]], aes(x=rank, y=rank_precision)) +
+    geom_smooth() +
+    ggtitle("PC") +
+    xlab("Rank") + ylab("Ranked Precision") +
+    geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+  plot2 <- ggplot(m2[[2]], aes(x=rank, y=rank_precision)) +
+    geom_smooth() +
+    ggtitle("bc3net") +
+    xlab("Rank") + ylab("Ranked Precision") +
+    geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+  plot3 <- ggplot(m3[[2]], aes(x=rank, y=rank_precision)) +
+    geom_smooth() +
+    ggtitle("GeneNet") +
+    xlab("Rank") + ylab("Ranked Precision") +
+    geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+  plot4 <- ggplot(m4[[2]], aes(x=rank, y=rank_precision)) +
+    geom_smooth() +
+    ggtitle("GENIE3") +
+    xlab("Rank") + ylab("Ranked Precision") +
+    geom_hline(yintercept=exp_precision, linetype="dashed", color="red") 
+  # note that earlier ranks have more values which might confound results. This is definitely true for bc3
+  
+  ### Adjusted ranked precision
+  plot5 <- ggplot(m1[[2]], aes(x=rank, y=rank_precision_adj)) +
+    geom_smooth() +
+    ggtitle("PC") +
+    xlab("Rank") + ylab("Ranked Precision (adjusted)") +
+    geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+  plot6 <- ggplot(m2[[2]], aes(x=rank, y=rank_precision_adj)) +
+    geom_smooth() +
+    ggtitle("bc3net") +
+    xlab("Rank") + ylab("Ranked Precision (adjusted)") +
+    geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+  plot7 <- ggplot(m3[[2]], aes(x=rank, y=rank_precision_adj)) +
+    geom_smooth() +
+    ggtitle("GeneNet") +
+    xlab("Rank") + ylab("Ranked Precision (adjusted)") +
+    geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+  plot8 <- ggplot(m4[[2]], aes(x=rank, y=rank_precision_adj)) +
+    geom_smooth() +
+    ggtitle("GENIE3") +
+    xlab("Rank") + ylab("Ranked Precision (adjusted)") +
+    geom_hline(yintercept=exp_precision, linetype="dashed", color="red") 
+  
+  grid.arrange(plot1, plot2, plot3, plot4, plot5, plot6, plot7, plot8, ncol=4)
+}
+
+```
+
+
+## X II. Weight functions
+```{r}
+bc3net_weights <- function(sim) {
+  
+  edges <- tribble(~gene1, ~gene2, ~weight)
+  
+  ordered <- as.character(1:length(sim))
+  sim <- sim[ordered, ordered] #weighted igraph
+  
+  for (i in 1:nrow(sim)) {
+    
+    PP <- which(sim[i,] > 0)
+    PP <- PP[PP >= i] #only iterate over columns that haven't been iterated over yet as row
+    
+    for (j in PP) {
+      edges <- add_row(edges, gene1=i, gene2=j, weight=sim[i, j])
+    }
+  }
+  
+  return(edges)
+}
+
+```
+## X III. Functions from Noise_adjustment file
+```{r}
+#calculate stats sergio uses to estimate library size effect
+sergio_lsstats <- function(experiment) {
+  lsstats <- group_by(experiment, field) %>%
+    summarise(across(plant1:plant60, sum)) %>%
+    mutate(across(plant1:plant60, log)) %>%
+    pivot_longer(cols=c(-field), names_to='plant') %>%
+    group_by(field) %>%
+    summarise(ls_mean = mean(value), ls_sd = sd(value)) %>%
+    summarise(mean = mean(ls_mean), sd = mean(ls_sd))
+
+  return(lsstats)
+}
+
+
+#log2 transform all counts from a dataset
+tibble_logtransform <- function(experiment) {
+  experiment <- experiment %>%
+      mutate(across(plant1:plant60, ~ log2(.x + 1)))
+  return(experiment)
+}
+
+
+tibble_summarize <- function(experiment, which_stat, which_level) {
+  
+  if(which_stat=='ls') {
+    
+    ls_plant <- group_by(experiment, field) %>%
+      summarise(across(plant1:plant60, sum))
+    
+    if (which_level=='plant') {
+      return(ls_plant)
+      
+    } else if (which_level=='field') {
+      
+      ls_field <- ls_plant %>%
+        pivot_longer(cols=c(-field), names_to='plant') %>%
+        group_by(field) %>%
+        summarise(ls_mean = mean(value), ls_var = var(value))
+      
+      return(ls_field)
+    }
+    
+  } else if(which_stat=='zc') {
+    
+    zero_count <- function(variable) {
+      sub <- sum(variable==0) / length(variable)
+      return(sub)
+    }
+    
+    zc_plant <- group_by(experiment, field) %>%
+      summarise(across(plant1:plant60, zero_count))
+    
+    if(which_level=='plant') {
+      return(zc_plant)
+      
+    } else if (which_level=='field') {
+      
+      zc_field <- zc_plant %>%
+        pivot_longer(cols=c(-field), names_to='plant') %>%
+        group_by(field) %>%
+        summarise(zc_mean = mean(value), zc_var = var(value))
+      
+      return(zc_field)
+    }
+    
+  } else if(which_stat=='zg') {
+    
+    zg_gene <- experiment %>%
+      mutate(zg = rowSums(select(experiment, starts_with('plant')) == 0) / 60) %>%
+      relocate(zg, .after=1)
+    #summarized over plants
+    
+    if(which_level == 'gene') {
+      return(zg_gene)
+      
+    } else if(which_level=='field') {
+      
+      zg_field <- group_by(zg_gene, field) %>%
+        summarise(zg_mean = mean(zg), zg_var = var(zg)) #if 'zg_mean' is named 'zg', the var calculates on the new column somehow
+      
+      return(zg_field)
+    }
+    
+  } else if(which_stat=='ge') {
+    
+    ge_gene <- experiment %>%
+      rowwise() %>%
+      mutate(avgge = mean(c_across(plant1:plant60))) %>% mutate(varge = var(c_across(plant1:plant60))) %>%
+      #need to specify plant1:plant60 because the variance would also include the newly generated mean column!
+      relocate(c(avgge, varge), .after=1)
+    
+    if(which_level=='gene') {
+      return(ungroup(ge_gene))
+      
+    } else if (which_level=='field') {
+      
+      ge_field <- group_by(ge_gene, field) %>%
+        summarise(avgge_mean = mean(avgge), avgge_var = var(avgge), varge_mean = mean(varge), varge_var = var(varge))
+      
+      return(ge_field)
+    }
+  }
+}
+
+#with log-transformed library sizes and log2-tranformed counts to calc avgge & varge
+tibble_summarize_original <- function(experiment, which_stat, which_level) {
+  
+  if(which_stat=='ls') {
+    
+    logls_plant <- group_by(experiment, field) %>%
+      summarise(across(plant1:plant60, sum)) %>%
+      mutate(across(plant1:plant60, log))
+    
+    if (which_level=='plant') {
+      return(logls_plant)
+      
+    } else if (which_level=='field') {
+      
+      logls_field <- logls_plant %>%
+        pivot_longer(cols=c(-field), names_to='plant') %>%
+        group_by(field) %>%
+        summarise(ls_mean = mean(value), ls_var = var(value))
+      
+      return(logls_field)
+    }
+    
+  } else if(which_stat=='zc') {
+    
+    zero_count <- function(variable) {
+      sub <- sum(variable==0) / length(variable)
+      return(sub)
+    }
+    
+    zc_plant <- group_by(experiment, field) %>%
+      summarise(across(plant1:plant60, zero_count))
+    
+    if(which_level=='plant') {
+      return(zc_plant)
+      
+    } else if (which_level=='field') {
+      
+      zc_field <- zc_plant %>%
+        pivot_longer(cols=c(-field), names_to='plant') %>%
+        group_by(field) %>%
+        summarise(zc_mean = mean(value), zc_var = var(value))
+      
+      return(zc_field)
+    }
+    
+  } else if(which_stat=='zg') {
+    
+    zg_gene <- experiment %>%
+      mutate(zg = rowSums(select(experiment, starts_with('plant')) == 0) / 60) %>%
+      relocate(zg, .after=1)
+    #summarized over plants
+    
+    if(which_level == 'gene') {
+      return(zg_gene)
+      
+    } else if(which_level=='field') {
+      
+      zg_field <- group_by(zg_gene, field) %>%
+        summarise(zg_mean = mean(zg), zg_var = var(zg)) #if 'zg_mean' is named 'zg', the var calculates on the new column somehow
+      
+      return(zg_field)
+    }
+    
+  } else if(which_stat=='ge') {
+    
+    ge_gene <- experiment %>%
+      mutate(across(plant1:plant60, ~ log2(.x + 1))) %>% #logtranform counts
+      rowwise() %>% #groups per row, useful when a vectorised function doesn't exist
+      mutate(avgge = mean(c_across(plant1:plant60))) %>% mutate(varge = var(c_across(plant1:plant60))) %>%
+      #need to specify plant1:plant60 because the variance would also include the newly generated mean column!
+      relocate(c(avgge, varge), .after=1)
+    
+    if(which_level=='gene') {
+      return(ge_gene)
+      
+    } else if (which_level=='field') {
+      
+      ge_field <- group_by(ge_gene, field) %>%
+        summarise(avgge_mean = mean(avgge), avgge_var = var(avgge), varge_mean = mean(varge), varge_var = var(varge))
+      
+      return(ge_field)
+    }
+  }
+}
+
+tibble_fieldstats <- function(experiment) {
+  fieldstats <- purrr::reduce(list(tibble_summarize(experiment, 'ls', 'field'),
+                                   tibble_summarize(experiment, 'zc', 'field'), 
+                                   tibble_summarize(experiment, 'zg', 'field'),
+                                   tibble_summarize(experiment, 'ge', 'field')),
+                              dplyr::left_join, by='field')
+}
+
+tibble_expstats <- function(fieldstats) {
+  expstats <- fieldstats %>%
+  summarise(ls = mean(ls_mean),
+            ls_avgvar = mean(ls_var),
+            zc = mean(zc_mean),
+            zc_avgvar = mean(zc_var),
+            zg = mean(zg_mean),
+            zg_avgvar = mean(zg_var),
+            avgge = mean(avgge_mean),
+            avgge_avgvar = mean(avgge_var),
+            varge = mean(varge_mean),
+            varge_avgvar = mean(varge_var)
+            )
+}
+
+load_exp <- function(expr_path) {
+  filenames <- list.files(expr_path, pattern='*.csv', full.names=TRUE)
+  exp_list <- lapply(filenames, fread) %>%
+    lapply(as_tibble)
+  
+  for (i in 1:length(exp_list)) {
+    if (i == 1) {
+      samples <- exp_list[[1]] %>%
+        mutate(field = 1)
+    } else {
+      sub <- mutate(exp_list[[i]], field = i)
+      samples <- rbind(samples, sub)
+    }
+  }
+  samples <- relocate(samples, field, .before=1)
+  colnames(samples) <- c('field', sprintf('plant%s', 1:(ncol(samples) - 1)))
+  
+  return(samples)
+}
+
+boxplot_merge <- function(tibble_list, colnames_vector, which_stat, which_level) {
+  
+  for (i in 1:length(tibble_list)) {
+    
+    sub <- tibble_summarize(tibble_list[[i]], which_stat, which_level)
+    
+    if(which_level=='plant') {
+      
+      sub <- sub %>%
+        pivot_longer(cols=c(-field), names_to='plant', values_to=which_stat) %>%
+        select(field, which_stat)
+      
+    } else if (which_level=='gene') {
+      
+      sub <- sub %>%
+        select(1, 2, 3)
+    }
+    
+    sub <- mutate(sub, exp=colnames_vector[i])
+    
+    if (i == 1) {
+      merged <- sub
+    } else {
+      merged <- as_tibble(rbind(merged, sub))
+    }
+  }
+  merged <- relocate(merged, exp, .before=1)
+  return(merged)
+}
+```
+
+
+# 100 Genes GRN
+
+## 60 Plants
+```{r}
+true_grn1 <- read_grn('SERGIO/data_sets/De-noised_100G_9T_300cPerT_4_DS1/Interaction_cID_4.txt', 100)
+
+### dirty: 100 genes, 60 plants, 100 fields ( ==> 100 simulations)
+load_rdata('inference_output/100g/60c')
+
+#Converting to list of edge-containing dataframes
+d1g0_pc_grns <- inf_to_grns(d1g0_pc)
+d1g0_bc3_grns <- inf_to_grns(d1g0_bc3)
+d1g0_gn_grns <- inf_to_grns(d1g0_gn)
+d1g0_genie_grns <- inf_to_grns(d1g0_genie, size=nrow(true_grn1)) #genie needs an nrow argument as it would have all edges
+# list of 100 edge-containing dfs
+
+#Precision and recall
+d1g0_pc_stats <- grns_to_stats(d1g0_pc_grns, true_grn1)
+d1g0_bc3_stats <- grns_to_stats(d1g0_bc3_grns, true_grn1)
+d1g0_gn_stats <- grns_to_stats(d1g0_gn_grns, true_grn1)
+d1g0_genie_stats <- grns_to_stats(d1g0_genie_grns, true_grn1) 
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+
+
+### Clean: 100 genes, 60 plants, 100 fields (==> 100 simulations)
+
+#Converting to list of edge-containing dataframes
+c1g0_pc_grns <- inf_to_grns(c1g0_pc)
+c1g0_bc3_grns <- inf_to_grns(c1g0_bc3)
+c1g0_gn_grns <- inf_to_grns(c1g0_gn)
+c1g0_genie_grns <- inf_to_grns(c1g0_genie, size=nrow(true_grn1))
+
+#Precision and recall
+c1g0_pc_stats <- grns_to_stats(c1g0_pc_grns, true_grn1)
+c1g0_bc3_stats <- grns_to_stats(c1g0_bc3_grns, true_grn1)
+c1g0_gn_stats <- grns_to_stats(c1g0_gn_grns, true_grn1)
+c1g0_genie_stats <- grns_to_stats(c1g0_genie_grns, true_grn1)
+```
+
+```{r}
+d1g0_merged_stats <- rbind(d1g0_pc_stats, d1g0_bc3_stats, d1g0_gn_stats, d1g0_genie_stats)
+c1g0_merged_stats <- rbind(c1g0_pc_stats, c1g0_bc3_stats, c1g0_gn_stats, c1g0_genie_stats)
+exp_precision1 <- nrow(true_grn1) / ((100*100 - 100) / 2)
+
+# Precision
+plot1 <- ggplot(d1g0_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.25) +
+  ggtitle("Dirty 100 Genes") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision1, linetype="dashed", color="red")
+
+plot2 <- ggplot(c1g0_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.25) +
+  ggtitle("Clean 100 Genes") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision1, linetype="dashed", color="red")
+
+grid.arrange(plot1, plot2, ncol=2)
+
+# Recall
+ggplot(d1g0_merged_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+
+ggplot(c1g0_merged_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+
+# Expected precision
+d1g0_merged_summ <- d1g0_merged_stats %>%
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(d1g0_merged_summ, prec_diff = mean_precision - exp_precision)
+
+c1g0_merged_summ <- c1g0_merged_stats %>% 
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(c1g0_merged_summ, prec_diff = mean_precision - exp_precision)
+
+```
+
+```{r}
+exp_precision1 <- nrow(true_grn1) / ((100*100 - 100) / 2)
+
+### Dirty
+for (i in 1:100) {
+  d1g0_pc_grns[[i]] <- arrange(d1g0_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(d1g0_gn_grns[[i]])) {
+    d1g0_gn_grns[[i]] <- arrange(d1g0_gn_grns[[i]], pval) # has a lot of similar values
+  }
+}
+
+d1g0_pc_rankprec <- grns_to_rankprec(d1g0_pc_grns, true_grn1)
+d1g0_bc3_rankprec <- grns_to_rankprec(d1g0_bc3_grns, true_grn1)
+d1g0_gn_rankprec <- grns_to_rankprec(d1g0_gn_grns, true_grn1)
+d1g0_genie_rankprec <- grns_to_rankprec(d1g0_genie_grns, true_grn1)
+
+plot_rankprec(d1g0_pc_rankprec, d1g0_bc3_rankprec, d1g0_gn_rankprec, d1g0_genie_rankprec, exp_precision1)
+
+### Clean
+for (i in 1:100) {
+  c1g0_pc_grns[[i]] <- arrange(c1g0_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(c1g0_gn_grns[[i]])) {
+    c1g0_gn_grns[[i]] <- arrange(c1g0_gn_grns[[i]], pval)
+  }
+}
+
+c1g0_pc_rankprec <- grns_to_rankprec(c1g0_pc_grns, true_grn1)
+c1g0_bc3_rankprec <- grns_to_rankprec(c1g0_bc3_grns, true_grn1)
+c1g0_gn_rankprec <- grns_to_rankprec(c1g0_gn_grns, true_grn1)
+c1g0_genie_rankprec <- grns_to_rankprec(c1g0_genie_grns, true_grn1)
+
+plot_rankprec(c1g0_pc_rankprec, c1g0_bc3_rankprec, c1g0_gn_rankprec, c1g0_genie_rankprec, exp_precision1)
+```
+
+## 200 Plants
+```{r}
+### Dirty
+
+load_rdata('inference_output/100g/200c')
+
+#Converting to list of edge-containing dataframes
+d1g2_pc_grns <- inf_to_grns(d1g2_pc)
+d1g2_bc3_grns <- inf_to_grns(d1g2_bc3)
+d1g2_gn_grns <- inf_to_grns(d1g2_gn)
+d1g2_genie_grns <- inf_to_grns(d1g2_genie, size=nrow(true_grn1)) #genie needs an nrow argument as it would have all edges
+# list of 100 edge-containing dfs
+
+#Precision and recall
+d1g2_pc_stats <- grns_to_stats(d1g2_pc_grns, true_grn1)
+d1g2_bc3_stats <- grns_to_stats(d1g2_bc3_grns, true_grn1)
+d1g2_gn_stats <- grns_to_stats(d1g2_gn_grns, true_grn1)
+d1g2_genie_stats <- grns_to_stats(d1g2_genie_grns, true_grn1) 
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+
+
+### Clean
+
+#Converting to list of edge-containing dataframes
+c1g2_pc_grns <- inf_to_grns(c1g2_pc)
+c1g2_bc3_grns <- inf_to_grns(c1g2_bc3)
+c1g2_gn_grns <- inf_to_grns(c1g2_gn)
+c1g2_genie_grns <- inf_to_grns(c1g2_genie, size=nrow(true_grn1))
+
+#Precision and recall
+c1g2_pc_stats <- grns_to_stats(c1g2_pc_grns, true_grn1)
+c1g2_bc3_stats <- grns_to_stats(c1g2_bc3_grns, true_grn1)
+c1g2_gn_stats <- grns_to_stats(c1g2_gn_grns, true_grn1)
+c1g2_genie_stats <- grns_to_stats(c1g2_genie_grns, true_grn1)
+```
+```{r}
+exp_precision1 <- nrow(true_grn1) / ((100*100 - 100) / 2)
+d1g2_merged_stats <- rbind(d1g2_pc_stats, d1g2_bc3_stats, d1g2_genie_stats)
+c1g2_merged_stats <- rbind(c1g2_pc_stats, c1g2_bc3_stats, c1g2_genie_stats)
+
+### Precision
+plot1 <- ggplot(d1g2_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.25) +
+  ggtitle("Dirty 100 Genes 200 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision1, linetype="dashed", color="red")
+
+plot2 <- ggplot(c1g2_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.25) +
+  ggtitle("Clean 100 Genes 200 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision1, linetype="dashed", color="red")
+
+grid.arrange(plot1, plot2, ncol=2)
+
+# Recall
+ggplot(d1g2_merged_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+
+ggplot(c1g2_merged_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+
+# Expected precision
+d1g2_merged_summ <- d1g2_merged_stats %>%
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(d1g2_merged_summ, prec_diff = mean_precision - exp_precision)
+
+c1g2_merged_summ <- c1g2_merged_stats %>% 
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(c1g2_merged_summ, prec_diff = mean_precision - exp_precision)
+```
+```{r}
+exp_precision1 <- nrow(true_grn1) / ((100*100 - 100) / 2)
+
+### Dirty
+for (i in 1:100) {
+  d1g2_pc_grns[[i]] <- arrange(d1g2_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(d1g2_gn_grns[[i]])) {
+    d1g2_gn_grns[[i]] <- arrange(d1g2_gn_grns[[i]], pval) # has a lot of similar values
+  }
+}
+
+d1g2_pc_rankprec <- grns_to_rankprec(d1g2_pc_grns, true_grn1)
+d1g2_bc3_rankprec <- grns_to_rankprec(d1g2_bc3_grns, true_grn1)
+d1g2_gn_rankprec <- grns_to_rankprec(d1g2_gn_grns, true_grn1)
+d1g2_genie_rankprec <- grns_to_rankprec(d1g2_genie_grns, true_grn1)
+
+plot_rankprec(d1g2_pc_rankprec, d1g2_bc3_rankprec, d1g2_gn_rankprec, d1g2_genie_rankprec, exp_precision1)
+
+### Clean
+for (i in 1:100) {
+  c1g2_pc_grns[[i]] <- arrange(c1g2_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(c1g2_gn_grns[[i]])) {
+    c1g2_gn_grns[[i]] <- arrange(c1g2_gn_grns[[i]], pval)
+  }
+}
+
+c1g2_pc_rankprec <- grns_to_rankprec(c1g2_pc_grns, true_grn1)
+c1g2_bc3_rankprec <- grns_to_rankprec(c1g2_bc3_grns, true_grn1)
+c1g2_gn_rankprec <- grns_to_rankprec(c1g2_gn_grns, true_grn1)
+c1g2_genie_rankprec <- grns_to_rankprec(c1g2_genie_grns, true_grn1)
+
+plot_rankprec(c1g2_pc_rankprec, c1g2_bc3_rankprec, c1g2_gn_rankprec, c1g2_genie_rankprec, exp_precision1)
+```
+## 500 Plants
+
+```{r}
+### dirty: 100 genes, 500 plants, 100 fields ( ==> 100 simulations)
+load_rdata('inference_output/100g/500c')
+
+#Converting to list of edge-containing dataframes
+d1g5_pc_grns <- inf_to_grns(d1g5_pc)
+d1g5_bc3_grns <- inf_to_grns(d1g5_bc3)
+d1g5_gn_grns <- inf_to_grns(d1g5_gn)
+d1g5_genie_grns <- inf_to_grns(d1g5_genie, size=nrow(true_grn1)) #genie needs an nrow argument as it would have all edges
+# list of 100 edge-containing dfs
+
+#Precision and recall
+d1g5_pc_stats <- grns_to_stats(d1g5_pc_grns, true_grn1)
+ed1g5_bc3_stats <- grns_to_stats(d1g5_bc3_grns, true_grn1)
+d1g5_gn_stats <- grns_to_stats(d1g5_gn_grns, true_grn1)
+d1g5_genie_stats <- grns_to_stats(d1g5_genie_grns, true_grn1) 
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+
+
+### Clean
+
+#Converting to list of edge-containing dataframes
+c1g5_pc_grns <- inf_to_grns(c1g5_pc)
+c1g5_bc3_grns <- inf_to_grns(c1g5_bc3)
+c1g5_gn_grns <- inf_to_grns(c1g5_gn)
+c1g5_genie_grns <- inf_to_grns(c1g5_genie, size=nrow(true_grn1))
+
+#Precision and recall
+c1g5_pc_stats <- grns_to_stats(c1g5_pc_grns, true_grn1)
+c1g5_bc3_stats <- grns_to_stats(c1g5_bc3_grns, true_grn1)
+c1g5_gn_stats <- grns_to_stats(c1g5_gn_grns, true_grn1)
+c1g5_genie_stats <- grns_to_stats(c1g5_genie_grns, true_grn1)
+```
+
+```{r}
+exp_precision1 <- nrow(true_grn1) / ((100*100 - 100) / 2)
+d1g5_merged_stats <- rbind(d1g5_pc_stats, d1g5_bc3_stats, d1g5_gn_stats, d1g5_genie_stats)
+c1g5_merged_stats <- rbind(c1g5_pc_stats, c1g5_bc3_stats, c1g5_gn_stats, c1g5_genie_stats)
+
+### Precision
+plot1 <- ggplot(d1g5_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.25) +
+  ggtitle("Dirty 100 Genes 500 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision1, linetype="dashed", color="red")
+
+plot2 <- ggplot(c1g5_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.25) +
+  ggtitle("Clean 100 Genes 500 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision1, linetype="dashed", color="red")
+
+grid.arrange(plot1, plot2, ncol=2)
+
+# Recall
+ggplot(d1g5_merged_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+
+ggplot(c1g5_merged_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+
+# Expected precision
+d1g5_merged_summ <- d1g5_merged_stats %>%
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(d1g5_merged_summ, prec_diff = mean_precision - exp_precision1)
+
+c1g5_merged_summ <- c1g5_merged_stats %>% 
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(c1g5_merged_summ, prec_diff = mean_precision - exp_precision1)
+```
+
+```{r}
+exp_precision1 <- nrow(true_grn1) / ((100*100 - 100) / 2)
+
+### Dirty
+for (i in 1:100) {
+  d1g5_pc_grns[[i]] <- arrange(d1g5_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(d1g5_gn_grns[[i]])) {
+    d1g5_gn_grns[[i]] <- arrange(d1g5_gn_grns[[i]], pval) # has a lot of similar values
+  }
+}
+
+d1g5_pc_rankprec <- grns_to_rankprec(d1g5_pc_grns, true_grn1)
+d1g5_bc3_rankprec <- grns_to_rankprec(d1g5_bc3_grns, true_grn1)
+d1g5_gn_rankprec <- grns_to_rankprec(d1g5_gn_grns, true_grn1)
+d1g5_genie_rankprec <- grns_to_rankprec(d1g5_genie_grns, true_grn1)
+
+plot_rankprec(d1g5_pc_rankprec, d1g5_bc3_rankprec, d1g5_gn_rankprec, d1g5_genie_rankprec, exp_precision1)
+
+### Clean
+for (i in 1:100) {
+  c1g5_pc_grns[[i]] <- arrange(c1g5_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(c1g5_gn_grns[[i]])) {
+    c1g5_gn_grns[[i]] <- arrange(c1g5_gn_grns[[i]], pval)
+  }
+}
+
+c1g5_pc_rankprec <- grns_to_rankprec(c1g5_pc_grns, true_grn1)
+c1g5_bc3_rankprec <- grns_to_rankprec(c1g5_bc3_grns, true_grn1)
+c1g5_gn_rankprec <- grns_to_rankprec(c1g5_gn_grns, true_grn1)
+c1g5_genie_rankprec <- grns_to_rankprec(c1g5_genie_grns, true_grn1)
+
+plot_rankprec(c1g5_pc_rankprec, c1g5_bc3_rankprec, c1g5_gn_rankprec, c1g5_genie_rankprec, exp_precision1)
+```
+
+
+## 1000 Plants
+
+```{r}
+### dirty: 100 genes, 1000 plants, 100 fields ( ==> 100 simulations)
+load_rdata('inference_output/100g/1000c')
+
+#Converting to list of edge-containing dataframes
+d1g10_pc_grns <- inf_to_grns(d1g10_pc)
+d1g10_bc3_grns <- inf_to_grns(d1g10_bc3)
+d1g10_gn_grns <- inf_to_grns(d1g10_gn)
+d1g10_genie_grns <- inf_to_grns(d1g10_genie, size=nrow(true_grn1)) #genie needs an nrow argument as it would have all edges
+# list of 100 edge-containing dfs
+
+#Precision and recall
+d1g10_pc_stats <- grns_to_stats(d1g10_pc_grns, true_grn1)
+d1g10_bc3_stats <- grns_to_stats(d1g10_bc3_grns, true_grn1)
+d1g10_gn_stats <- grns_to_stats(d1g10_gn_grns, true_grn1)
+d1g10_genie_stats <- grns_to_stats(d1g10_genie_grns, true_grn1) 
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+
+
+### Clean
+
+#Converting to list of edge-containing dataframes
+c1g10_pc_grns <- inf_to_grns(c1g10_pc)
+c1g10_bc3_grns <- inf_to_grns(c1g10_bc3)
+c1g10_gn_grns <- inf_to_grns(c1g10_gn)
+c1g10_genie_grns <- inf_to_grns(c1g10_genie, size=nrow(true_grn1))
+
+#Precision and recall
+c1g10_pc_stats <- grns_to_stats(c1g10_pc_grns, true_grn1)
+c1g10_bc3_stats <- grns_to_stats(c1g10_bc3_grns, true_grn1)
+c1g10_gn_stats <- grns_to_stats(c1g10_gn_grns, true_grn1)
+c1g10_genie_stats <- grns_to_stats(c1g10_genie_grns, true_grn1)
+```
+
+```{r}
+exp_precision1 <- nrow(true_grn1) / ((100*100 - 100) / 2)
+d1g10_merged_stats <- rbind(d1g10_pc_stats, d1g10_bc3_stats, d1g10_gn_stats, d1g10_genie_stats)
+c1g10_merged_stats <- rbind(c1g10_pc_stats, c1g10_bc3_stats, c1g10_gn_stats, c1g10_genie_stats)
+
+### Precision
+plot1 <- ggplot(d1g10_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.25) +
+  ggtitle("Dirty 100 Genes 1000 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision1, linetype="dashed", color="red")
+
+plot2 <- ggplot(c1g10_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.25) +
+  ggtitle("Clean 100 Genes 1000 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision1, linetype="dashed", color="red")
+
+grid.arrange(plot1, plot2, ncol=2)
+
+# Recall
+ggplot(d1g10_merged_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+
+ggplot(c1g10_merged_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+
+# Expected precision
+d1g10_merged_summ <- d1g10_merged_stats %>%
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(d1g10_merged_summ, prec_diff = mean_precision - exp_precision1)
+
+c1g10_merged_summ <- c1g10_merged_stats %>% 
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(c1g10_merged_summ, prec_diff = mean_precision - exp_precision1)
+```
+
+```{r}
+exp_precision1 <- nrow(true_grn1) / ((100*100 - 100) / 2)
+
+### Dirty
+for (i in 1:100) {
+  d1g10_pc_grns[[i]] <- arrange(d1g10_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(d1g10_gn_grns[[i]])) {
+    d1g10_gn_grns[[i]] <- arrange(d1g10_gn_grns[[i]], pval) # has a lot of similar values
+  }
+}
+
+d1g10_pc_rankprec <- grns_to_rankprec(d1g10_pc_grns, true_grn1)
+d1g10_bc3_rankprec <- grns_to_rankprec(d1g10_bc3_grns, true_grn1)
+d1g10_gn_rankprec <- grns_to_rankprec(d1g10_gn_grns, true_grn1)
+d1g10_genie_rankprec <- grns_to_rankprec(d1g10_genie_grns, true_grn1)
+
+plot_rankprec(d1g10_pc_rankprec, d1g10_bc3_rankprec, d1g10_gn_rankprec, d1g10_genie_rankprec, exp_precision1)
+
+### Clean
+for (i in 1:100) {
+  c1g10_pc_grns[[i]] <- arrange(c1g10_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(c1g10_gn_grns[[i]])) {
+    c1g10_gn_grns[[i]] <- arrange(c1g10_gn_grns[[i]], pval)
+  }
+}
+
+c1g10_pc_rankprec <- grns_to_rankprec(c1g10_pc_grns, true_grn1)
+c1g10_bc3_rankprec <- grns_to_rankprec(c1g10_bc3_grns, true_grn1)
+c1g10_gn_rankprec <- grns_to_rankprec(c1g10_gn_grns, true_grn1)
+c1g10_genie_rankprec <- grns_to_rankprec(c1g10_genie_grns, true_grn1)
+
+plot_rankprec(c1g10_pc_rankprec, c1g10_bc3_rankprec, c1g10_gn_rankprec, c1g10_genie_rankprec, exp_precision1)
+```
+
+
+# 400 Genes GRN
+
+## 60 Plants
+
+```{r}
+### Reading data ###
+####################
+true_grn4 <- read_grn('SERGIO/data_sets/De-noised_400G_9T_300cPerT_5_DS2/Interaction_cID_5.txt', 400)
+
+c4g0_pc <- readRDS('inference_output/400g/60c/c4g_pc.rds')
+c4g0_bc3 <- readRDS('inference_output/400g/60c/c4g_bc3.rds')
+c4g0_gn <- readRDS('inference_output/400g/60c/c4g_gn.rds')
+c4g0_genie <- readRDS('inference_output/400g/60c/c4g_genie.rds')
+
+d4g0_pc <- readRDS('inference_output/400g/60c/d4g_pc.rds')
+d4g0_bc3 <- readRDS('inference_output/400g/60c/d4g_bc3.rds')
+d4g0_gn <- readRDS('inference_output/400g/60c/d4g_gn.rds')
+d4g0_genie <- readRDS('inference_output/400g/60c/d4g_genie.rds')
+```
+
+
+```{r}
+### Extracting edges from results ###
+#####################################
+### Clean
+c4g0_pc_grns <- inf_to_grns(c4g0_pc)
+c4g0_bc3_grns <- inf_to_grns(c4g0_bc3)
+c4g0_gn_grns <- inf_to_grns(c4g0_gn)
+c4g0_genie_grns <- inf_to_grns(c4g0_genie, size=nrow(true_grn4))
+#c4g_genie_grns_all <- inf_to_grns(c4g_genie)
+
+#Precision and recall
+c4g0_pc_stats <- grns_to_stats(c4g0_pc_grns, true_grn4)
+c4g0_bc3_stats <- grns_to_stats(c4g0_bc3_grns, true_grn4)
+c4g0_gn_stats <- grns_to_stats(c4g0_gn_grns, true_grn4)
+c4g0_genie_stats <- grns_to_stats(c4g0_genie_grns, true_grn4)
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+
+### Dirty
+d4g0_pc_grns <- inf_to_grns(d4g0_pc)
+d4g0_bc3_grns <- inf_to_grns(d4g0_bc3)
+d4g0_gn_grns <- inf_to_grns(d4g0_gn)
+d4g0_genie_grns <- inf_to_grns(d4g0_genie, size=nrow(true_grn4))
+
+#Precision and recall
+d4g0_pc_stats <- grns_to_stats(d4g0_pc_grns, true_grn4)
+d4g0_bc3_stats <- grns_to_stats(d4g0_bc3_grns, true_grn4)
+d4g0_gn_stats <- grns_to_stats(d4g0_gn_grns, true_grn4)
+d4g0_genie_stats <- grns_to_stats(d4g0_genie_grns, true_grn4)
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+```
+```{r}
+c4g0_merged_stats <- rbind(c4g0_pc_stats, c4g0_bc3_stats, c4g0_gn_stats, c4g0_genie_stats)
+d4g0_merged_stats <- rbind(d4g0_pc_stats, d4g0_bc3_stats, d4g0_gn_stats, d4g0_genie_stats)
+exp_precision <- nrow(true_grn4) / ((400*400 - 400) / 2)
+
+# Precision
+plot1 <- ggplot(c4g0_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.05) +
+  ggtitle("Clean 400 Genes") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+plot2 <- ggplot(d4g0_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.05) +
+  ggtitle("Dirty 400 Genes") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+
+grid.arrange(plot1, plot2, ncol=2)
+
+# Recall
+ggplot(c4g_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+
+# Expected precision
+d4g0_merged_summ <- d4g0_merged_stats %>%
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(d4g0_merged_summ, prec_diff = mean_precision - exp_precision)
+
+c4g0_merged_summ <- c4g0_merged_stats %>% 
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(c4g0_merged_summ, prec_diff = mean_precision - exp_precision)
+
+#The clean data does not perform better than random
+```
+```{r}
+exp_precision4 <- nrow(true_grn4) / ((400*400 - 400) / 2)
+
+for (i in 1:100) {
+  d4g0_pc_grns[[i]] <- arrange(d4g0_pc_grns[[i]], p) #not ordered by p-value/weight
+  d4g0_gn_grns[[i]] <- arrange(d4g0_gn_grns[[i]], pval) # has a lot of similar values
+}
+
+d4g0_pc_rankprec <- grns_to_rankprec(d4g0_pc_grns, true_grn4)
+d4g0_bC3_rankprec <- grns_to_rankprec(d4g0_bc3_grns, true_grn4)
+d4g0_gn_rankprec <- grns_to_rankprec(d4g0_gn_grns, true_grn4)
+d4g0_genie_rankprec <- grns_to_rankprec(d4g0_genie_grns, true_grn4)
+
+### Ranked Precision
+plot1 <- ggplot(d4g0_pc_rankprec[[2]], aes(x=rank, y=rank_precision)) +
+  geom_smooth() +
+  ggtitle("PC") +
+  xlab("Rank") + ylab("Ranked Precision") +
+  geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+plot2 <- ggplot(d4g0_bc3_rankprec[[2]], aes(x=rank, y=rank_precision)) +
+  geom_smooth() +
+  ggtitle("bc3net") +
+  xlab("Rank") + ylab("Ranked Precision") +
+  geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+plot3 <- ggplot(d4g0_gn_rankprec[[2]], aes(x=rank, y=rank_precision)) +
+  geom_smooth() +
+  ggtitle("GeneNet") +
+  xlab("Rank") + ylab("Ranked Precision") +
+  geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+plot4 <- ggplot(d4g0_genie_rankprec[[2]], aes(x=rank, y=rank_precision)) +
+  geom_smooth() +
+  ggtitle("GENIE3") +
+  xlab("Rank") + ylab("Ranked Precision") +
+  geom_hline(yintercept=exp_precision, linetype="dashed", color="red") 
+grid.arrange(plot1, plot2, plot3, plot4, ncol=2)
+# note that earlier ranks have more values which might confound results. This is definitely true for bc3
+
+### Adjusted ranked precision
+plot5 <- ggplot(d4g0_pc_rankprec[[2]], aes(x=rank, y=rank_precision_adj)) +
+  geom_smooth() +
+  ggtitle("PC") +
+  xlab("Rank") + ylab("Ranked Precision (adjusted)") +
+  geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+plot6 <- ggplot(d4g0_bc3_rankprec[[2]], aes(x=rank, y=rank_precision_adj)) +
+  geom_smooth() +
+  ggtitle("bc3net") +
+  xlab("Rank") + ylab("Ranked Precision (adjusted)") +
+  geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+plot7 <- ggplot(d4g0_gn_rankprec[[2]], aes(x=rank, y=rank_precision_adj)) +
+  geom_smooth() +
+  ggtitle("GeneNet") +
+  xlab("Rank") + ylab("Ranked Precision (adjusted)") +
+  geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+plot8 <- ggplot(d4g0_genie_rankprec[[2]], aes(x=rank, y=rank_precision_adj)) +
+  geom_smooth() +
+  ggtitle("GENIE3") +
+  xlab("Rank") + ylab("Ranked Precision (adjusted)") +
+  geom_hline(yintercept=exp_precision, linetype="dashed", color="red") 
+grid.arrange(plot5, plot6, plot7, plot8, ncol=2)
+
+grid.arrange(plot1, plot2, plot3, plot4, plot5, plot6, plot7, plot8, ncol=4)
+
+# After adjusting so that all ranks have 100 results, we see that for pc, gn and genie the results seem randomly spread out over their ranks.
+
+### Clean
+for (i in 1:100) {
+  c4g0_pc_grns[[i]] <- arrange(c4g0_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(c4g0_gn_grns[[i]])) {
+    c4g0_gn_grns[[i]] <- arrange(c4g0_gn_grns[[i]], pval) # has a lot of similar values
+  }
+}
+
+c4g0_pc_rankprec <- grns_to_rankprec(c4g0_pc_grns, true_grn4)
+c4g0_bc3_rankprec <- grns_to_rankprec(c4g0_bc3_grns, true_grn4)
+c4g0_gn_rankprec <- grns_to_rankprec(c4g0_gn_grns, true_grn4)
+c4g0_genie_rankprec <- grns_to_rankprec(c4g0_genie_grns, true_grn4)
+
+plot_rankprec(c4g0_pc_rankprec, c4g0_bc3_rankprec, c4g0_gn_rankprec, c4g0_genie_rankprec, exp_precision4)
+```
+
+
+## 200 Plants
+
+
+```{r}
+### Reading data ###
+####################
+
+true_grn4 <- read_grn('SERGIO/data_sets/De-noised_400G_9T_300cPerT_5_DS2/Interaction_cID_5.txt', 400)
+
+load_rdata('inference_output/400g/200c')
+```
+
+
+```{r}
+### Extracting edges from results ###
+#####################################
+### Clean
+c4g2_pc_grns <- inf_to_grns(c4g2_pc)
+c4g2_bc3_grns <- inf_to_grns(c4g2_bc3)
+c4g2_gn_grns <- inf_to_grns(c4g2_gn)
+c4g2_genie_grns <- inf_to_grns(c4g2_genie, size=nrow(true_grn4))
+#c4g_genie_grns_all <- inf_to_grns(c4g_genie)
+
+#Precision and recall
+c4g2_pc_stats <- grns_to_stats(c4g2_pc_grns, true_grn4)
+c4g2_bc3_stats <- grns_to_stats(c4g2_bc3_grns, true_grn4)
+c4g2_gn_stats <- grns_to_stats(c4g2_gn_grns, true_grn4)
+c4g2_genie_stats <- grns_to_stats(c4g2_genie_grns, true_grn4)
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+
+### Dirty
+d4g2_pc_grns <- inf_to_grns(d4g2_pc)
+d4g2_bc3_grns <- inf_to_grns(d4g2_bc3)
+d4g2_gn_grns <- inf_to_grns(d4g2_gn)
+d4g2_genie_grns <- inf_to_grns(d4g2_genie, size=nrow(true_grn4))
+
+#Precision and recall
+d4g2_pc_stats <- grns_to_stats(d4g2_pc_grns, true_grn4)
+d4g2_bc3_stats <- grns_to_stats(d4g2_bc3_grns, true_grn4)
+d4g2_gn_stats <- grns_to_stats(d4g2_gn_grns, true_grn4)
+d4g2_genie_stats <- grns_to_stats(d4g2_genie_grns, true_grn4)
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+```
+
+```{r}
+c4g2_merged_stats <- rbind(c4g2_pc_stats, c4g2_bc3_stats, c4g2_gn_stats, c4g2_genie_stats)
+d4g2_merged_stats <- rbind(d4g2_pc_stats, d4g2_bc3_stats, d4g2_gn_stats, d4g2_genie_stats)
+exp_precision4 <- nrow(true_grn4) / ((400*400 - 400) / 2)
+
+# Precision
+plot1 <- ggplot(c4g2_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.1) +
+  ggtitle("Clean 400 Genes 200 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision4, linetype="dashed", color="red")
+plot2 <- ggplot(d4g2_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.1) +
+  ggtitle("Dirty 400 Genes 200 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision4, linetype="dashed", color="red")
+
+grid.arrange(plot1, plot2, ncol=2)
+
+# Recall
+plot_rec_1 <- ggplot(c4g2_merged_stats, aes(x=method, y=rec, fill=method)) +
+  geom_boxplot() + 
+  ylim(NA, 0.1) +
+  ggtitle("Clean 400 Genes 200 Cells") +
+  xlab("Methods") + ylab("Recall")
+plot_rec_2 <- ggplot(d4g2_merged_stats, aes(x=method, y=rec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.1) +
+  ggtitle("Dirty 400 Genes 200 Cells") +
+  xlab("Methods") + ylab("Recall")
+  
+grid.arrange(plot_rec_1, plot_rec_2, ncol=2)
+
+# Expected precision
+d4g2_merged_summ <- d4g2_merged_stats %>%
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(d4g2_merged_summ, prec_diff = mean_precision - exp_precision4)
+
+c4g2_merged_summ <- c4g2_merged_stats %>% 
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(c4g2_merged_summ, prec_diff = mean_precision - exp_precision4)
+
+# Not better than random, genenet still performs worst.
+```
+
+```{r}
+### Dirty
+for (i in 1:100) {
+  d4g2_pc_grns[[i]] <- arrange(d4g2_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(d4g2_gn_grns[[i]])) {
+    d4g2_gn_grns[[i]] <- arrange(d4g2_gn_grns[[i]], pval) # has a lot of similar values
+  }
+}
+
+d4g2_pc_rankprec <- grns_to_rankprec(d4g2_pc_grns, true_grn4)
+d4g2_bc3_rankprec <- grns_to_rankprec(d4g2_bc3_grns, true_grn4)
+d4g2_gn_rankprec <- grns_to_rankprec(d4g2_gn_grns, true_grn4)
+d4g2_genie_rankprec <- grns_to_rankprec(d4g2_genie_grns, true_grn4)
+
+plot_rankprec(d4g2_pc_rankprec, d4g2_bc3_rankprec, d4g2_gn_rankprec, d4g2_genie_rankprec, exp_precision4)
+
+### Clean
+for (i in 1:100) {
+  c4g2_pc_grns[[i]] <- arrange(c4g2_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(c4g2_gn_grns[[i]])) {
+    c4g2_gn_grns[[i]] <- arrange(c4g2_gn_grns[[i]], pval)
+  }
+}
+
+c4g2_pc_rankprec <- grns_to_rankprec(c4g2_pc_grns, true_grn4)
+c4g2_bc3_rankprec <- grns_to_rankprec(c4g2_bc3_grns, true_grn4)
+c4g2_gn_rankprec <- grns_to_rankprec(c4g2_gn_grns, true_grn4)
+c4g2_genie_rankprec <- grns_to_rankprec(c4g2_genie_grns, true_grn4)
+
+plot_rankprec(c4g2_pc_rankprec, c4g2_bc3_rankprec, c4g2_gn_rankprec, c4g2_genie_rankprec, exp_precision4)
+```
+
+
+## 500 Plants
+
+```{r}
+### Reading data ###
+####################
+
+true_grn4 <- read_grn('SERGIO/data_sets/De-noised_400G_9T_300cPerT_5_DS2/Interaction_cID_5.txt', 400)
+
+load_rdata('inference_output/400g/500c')
+```
+
+
+```{r}
+### Extracting edges from results ###
+#####################################
+### Clean
+c4g5_pc_grns <- inf_to_grns(c4g5_pc)
+c4g5_bc3_grns <- inf_to_grns(c4g5_bc3)
+c4g5_gn_grns <- inf_to_grns(c4g5_gn)
+c4g5_genie_grns <- inf_to_grns(c4g5_genie, size=nrow(true_grn4))
+#c4g_genie_grns_all <- inf_to_grns(c4g_genie)
+
+#Precision and recall
+c4g5_pc_stats <- grns_to_stats(c4g5_pc_grns, true_grn4)
+c4g5_bc3_stats <- grns_to_stats(c4g5_bc3_grns, true_grn4)
+c4g5_gn_stats <- grns_to_stats(c4g5_gn_grns, true_grn4)
+c4g5_genie_stats <- grns_to_stats(c4g5_genie_grns, true_grn4)
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+
+### Dirty
+d4g5_pc_grns <- inf_to_grns(d4g5_pc)
+d4g5_bc3_grns <- inf_to_grns(d4g5_bc3)
+d4g5_gn_grns <- inf_to_grns(d4g5_gn)
+d4g5_genie_grns <- inf_to_grns(d4g5_genie, size=nrow(true_grn4))
+
+#Precision and recall
+d4g5_pc_stats <- grns_to_stats(d4g5_pc_grns, true_grn4)
+d4g5_bc3_stats <- grns_to_stats(d4g5_bc3_grns, true_grn4)
+d4g5_gn_stats <- grns_to_stats(d4g5_gn_grns, true_grn4)
+d4g5_genie_stats <- grns_to_stats(d4g5_genie_grns, true_grn4)
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+```
+
+```{r}
+c4g5_merged_stats <- rbind(c4g5_pc_stats, c4g5_bc3_stats, c4g5_gn_stats, c4g5_genie_stats)
+d4g5_merged_stats <- rbind(d4g5_pc_stats, d4g5_bc3_stats, d4g5_gn_stats, d4g5_genie_stats)
+exp_precision4 <- nrow(true_grn4) / ((400*400 - 400) / 2)
+
+# Precision
+plot1 <- ggplot(c4g5_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  #ylim(NA, 0.05) +
+  ggtitle("Clean 400 Genes 200 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision4, linetype="dashed", color="red")
+plot2 <- ggplot(d4g5_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  #ylim(NA, 0.05) +
+  ggtitle("Dirty 400 Genes 200 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision4, linetype="dashed", color="red")
+
+grid.arrange(plot1, plot2, ncol=2)
+
+# Recall
+ggplot(c4g5_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+ggplot(d4g5_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+
+# Expected precision
+d4g5_merged_summ <- d4g5_merged_stats %>%
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(d4g5_merged_summ, prec_diff = mean_precision - exp_precision4)
+
+c4g5_merged_summ <- c4g5_merged_stats %>% 
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(c4g5_merged_summ, prec_diff = mean_precision - exp_precision4)
+
+# < VERDICT >
+```
+
+```{r}
+### Dirty
+for (i in 1:100) {
+  d4g5_pc_grns[[i]] <- arrange(d4g5_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(d4g5_gn_grns[[i]])) {
+    d4g5_gn_grns[[i]] <- arrange(d4g5_gn_grns[[i]], pval) # has a lot of similar values
+  }
+}
+
+d4g5_pc_rankprec <- grns_to_rankprec(d4g5_pc_grns, true_grn4)
+d4g5_bc3_rankprec <- grns_to_rankprec(d4g5_bc3_grns, true_grn4)
+d4g5_gn_rankprec <- grns_to_rankprec(d4g5_gn_grns, true_grn4)
+d4g5_genie_rankprec <- grns_to_rankprec(d4g5_genie_grns, true_grn4)
+
+plot_rankprec(d4g5_pc_rankprec, d4g5_bc3_rankprec, d4g5_gn_rankprec, d4g5_genie_rankprec, exp_precision4)
+
+### Clean
+for (i in 1:100) {
+  c4g5_pc_grns[[i]] <- arrange(c4g5_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(c4g5_gn_grns[[i]])) {
+    c4g5_gn_grns[[i]] <- arrange(c4g5_gn_grns[[i]], pval)
+  }
+}
+
+c4g5_pc_rankprec <- grns_to_rankprec(c4g5_pc_grns, true_grn4)
+c4g5_bc3_rankprec <- grns_to_rankprec(c4g5_bc3_grns, true_grn4)
+c4g5_gn_rankprec <- grns_to_rankprec(c4g5_gn_grns, true_grn4)
+c4g5_genie_rankprec <- grns_to_rankprec(c4g5_genie_grns, true_grn4)
+
+plot_rankprec(c4g5_pc_rankprec, c4g5_bc3_rankprec, c4g5_gn_rankprec, c4g5_genie_rankprec, exp_precision4)
+```
+
+
+## 1000 Plants
+
+```{r}
+### Reading data ###
+####################
+
+true_grn4 <- read_grn('SERGIO/data_sets/De-noised_400G_9T_300cPerT_5_DS2/Interaction_cID_5.txt', 400)
+
+load_rdata('inference_output/400g/1000c')
+```
+
+
+```{r}
+### Extracting edges from results ###
+#####################################
+### Clean
+c4g2_pc_grns <- inf_to_grns(c4g2_pc)
+c4g2_bc3_grns <- inf_to_grns(c4g2_bc3)
+c4g2_gn_grns <- inf_to_grns(c4g2_gn)
+c4g2_genie_grns <- inf_to_grns(c4g2_genie, size=nrow(true_grn4))
+#c4g_genie_grns_all <- inf_to_grns(c4g_genie)
+
+#Precision and recall
+c4g2_pc_stats <- grns_to_stats(c4g2_pc_grns, true_grn4)
+c4g2_bc3_stats <- grns_to_stats(c4g2_bc3_grns, true_grn4)
+c4g2_gn_stats <- grns_to_stats(c4g2_gn_grns, true_grn4)
+c4g2_genie_stats <- grns_to_stats(c4g2_genie_grns, true_grn4)
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+
+### Dirty
+d4g2_pc_grns <- inf_to_grns(d4g2_pc)
+d4g2_bc3_grns <- inf_to_grns(d4g2_bc3)
+d4g2_gn_grns <- inf_to_grns(d4g2_gn)
+d4g2_genie_grns <- inf_to_grns(d4g2_genie, size=nrow(true_grn4))
+
+#Precision and recall
+d4g2_pc_stats <- grns_to_stats(d4g2_pc_grns, true_grn4)
+d4g2_bc3_stats <- grns_to_stats(d4g2_bc3_grns, true_grn4)
+d4g2_gn_stats <- grns_to_stats(d4g2_gn_grns, true_grn4)
+d4g2_genie_stats <- grns_to_stats(d4g2_genie_grns, true_grn4)
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+```
+
+```{r}
+c4g2_merged_stats <- rbind(c4g2_pc_stats, c4g2_bc3_stats, c4g2_gn_stats, c4g2_genie_stats)
+d4g2_merged_stats <- rbind(d4g2_pc_stats, d4g2_bc3_stats, d4g2_gn_stats, d4g2_genie_stats)
+exp_precision4 <- nrow(true_grn4) / ((400*400 - 400) / 2)
+
+# Precision
+plot1 <- ggplot(c4g2_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  #ylim(NA, 0.05) +
+  ggtitle("Clean 400 Genes 200 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision4, linetype="dashed", color="red")
+plot2 <- ggplot(d4g2_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  #ylim(NA, 0.05) +
+  ggtitle("Dirty 400 Genes 200 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision4, linetype="dashed", color="red")
+
+grid.arrange(plot1, plot2, ncol=2)
+
+# Recall
+ggplot(c4g2_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+ggplot(d4g2_stats, aes(x=method, y=rec)) +
+  geom_boxplot()
+
+# Expected precision
+d4g2_merged_summ <- d4g2_merged_stats %>%
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(d4g2_merged_summ, prec_diff = mean_precision - exp_precision4)
+
+c4g2_merged_summ <- c4g2_merged_stats %>% 
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(c4g2_merged_summ, prec_diff = mean_precision - exp_precision4)
+
+# < VERDICT >
+```
+
+```{r}
+### Dirty
+for (i in 1:100) {
+  d4g2_pc_grns[[i]] <- arrange(d4g2_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(d4g2_gn_grns[[i]])) {
+    d4g2_gn_grns[[i]] <- arrange(d4g2_gn_grns[[i]], pval) # has a lot of similar values
+  }
+}
+
+d4g2_pc_rankprec <- grns_to_rankprec(d4g2_pc_grns, true_grn4)
+d4g2_bc3_rankprec <- grns_to_rankprec(d4g2_bc3_grns, true_grn4)
+d4g2_gn_rankprec <- grns_to_rankprec(d4g2_gn_grns, true_grn4)
+d4g2_genie_rankprec <- grns_to_rankprec(d4g2_genie_grns, true_grn4)
+
+plot_rankprec(d4g2_pc_rankprec, d4g2_bc3_rankprec, d4g2_gn_rankprec, d4g2_genie_rankprec, exp_precision4)
+
+### Clean
+for (i in 1:100) {
+  c4g2_pc_grns[[i]] <- arrange(c4g2_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(c4g2_gn_grns[[i]])) {
+    c4g2_gn_grns[[i]] <- arrange(c4g2_gn_grns[[i]], pval)
+  }
+}
+
+c4g2_pc_rankprec <- grns_to_rankprec(c4g2_pc_grns, true_grn4)
+c4g2_bc3_rankprec <- grns_to_rankprec(c4g2_bc3_grns, true_grn4)
+c4g2_gn_rankprec <- grns_to_rankprec(c4g2_gn_grns, true_grn4)
+c4g2_genie_rankprec <- grns_to_rankprec(c4g2_genie_grns, true_grn4)
+
+plot_rankprec(c4g2_pc_rankprec, c4g2_bc3_rankprec, c4g2_gn_rankprec, c4g2_genie_rankprec, exp_precision4)
+```
+
+# 1200 Genes GRN
+
+## 60 Plants
+
+```{r}
+### Reading data ###
+####################
+true_grn12 <- read_grn('SERGIO/data_sets/De-noised_1200G_9T_300cPerT_6_DS3/Interaction_cID_6.txt', 1200)
+
+load('inference_output/1200g/60c/c12g_pc.RData')
+load('inference_output/1200g/60c/c12g_bc3.RData')
+load('inference_output/1200g/60c/c12g_gn.RData')
+load('inference_output/1200g/60c/c12g_genie.RData')
+
+load('inference_output/1200g/60c/d12g_pc.RData')
+load('inference_output/1200g/60c/d12g_bc3.RData')
+load('inference_output/1200g/60c/d12g_gn.RData')
+load('inference_output/1200g/60c/d12g_genie.RData')
+```
+
+
+```{r}
+### Extracting edges from results ###
+#####################################
+c12g0_pc_grns <- inf_to_grns(c12g_pc)
+c12g0_bc3_grns <- inf_to_grns(c12g_bc3)
+c12g0_gn_grns <- inf_to_grns(c12g_gn)
+c12g0_genie_grns <- inf_to_grns(c12g_genie, size=nrow(true_grn12))
+#c12g_genie_grns_all <- inf_to_grns(c12g_genie)
+
+#Precision and recall
+c12g0_pc_stats <- grns_to_stats(c12g0_pc_grns, true_grn12)
+c12g0_bc3_stats <- grns_to_stats(c12g0_bc3_grns, true_grn12)
+c12g0_gn_stats <- grns_to_stats(c12g0_gn_grns, true_grn12)
+c12g0_genie_stats <- grns_to_stats(c12g0_genie_grns, true_grn12)
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+```
+```{r}
+d12g0_pc_grns <- inf_to_grns(d12g_pc)
+d12g0_bc3_grns <- inf_to_grns(d12g_bc3)
+d12g0_gn_grns <- inf_to_grns(d12g_gn)
+d12g0_genie_grns <- inf_to_grns(d12g_genie, size=nrow(true_grn12))
+# the amount of edges is less than half of all positives: nrow(true_grn12)
+
+#Precision and recall
+d12g0_pc_stats <- grns_to_stats(d12g0_pc_grns, true_grn12)
+d12g0_bc3_stats <- grns_to_stats(d12g0_bc3_grns, true_grn12)
+d12g0_gn_stats <- grns_to_stats(d12g0_gn_grns, true_grn12)
+d12g0_genie_stats <- grns_to_stats(d12g0_genie_grns, true_grn12)
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+```
+
+```{r}
+# Expected precision
+c12g0_merged_stats <- rbind(c12g0_pc_stats, c12g0_bc3_stats, c12g0_gn_stats, c12g0_genie_stats)
+d12g0_merged_stats <- rbind(d12g0_pc_stats, d12g0_bc3_stats, d12g0_gn_stats, d12g0_genie_stats)
+exp_precision <- nrow(true_grn12) / ((1200*1200 - 1200) / 2)
+
+# Precision
+plot1 <- ggplot(c12g0_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.1) +
+  ggtitle("Clean 1200 Genes") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+plot2 <- ggplot(d12g0_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.1) +
+  ggtitle("Dirty 1200 Genes") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision, linetype="dashed", color="red")
+
+grid.arrange(plot1, plot2, ncol=2)
+
+# Expected precision
+d12g0_merged_summ <- d12g0_merged_stats %>%
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(d12g0_merged_summ, prec_diff = mean_precision - exp_precision)
+
+c12g0_merged_summ <- c12g0_merged_stats %>% 
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(c12g0_merged_summ, prec_diff = mean_precision - exp_precision)
+
+# PC significantly outperforming other methods.
+```
+
+```{r}
+exp_precision12 <- nrow(true_grn12) / ((1200*1200 - 1200) / 2)
+
+### Dirty
+for (i in 1:100) {
+  d12g0_pc_grns[[i]] <- arrange(d12g0_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(d12g0_gn_grns[[i]])) {
+    d12g0_gn_grns[[i]] <- arrange(d12g0_gn_grns[[i]], pval) # has a lot of similar values
+  }
+}
+
+d12g0_pc_rankprec <- grns_to_rankprec(d12g0_pc_grns, true_grn12)
+d12g0_bc3_rankprec <- grns_to_rankprec(d12g0_bc3_grns, true_grn12)
+d12g0_gn_rankprec <- grns_to_rankprec(d12g0_gn_grns, true_grn12)
+d12g0_genie_rankprec <- grns_to_rankprec(d12g0_genie_grns, true_grn12)
+
+plot_rankprec(d12g0_pc_rankprec, d12g0_bc3_rankprec, d12g0_gn_rankprec, d12g0_genie_rankprec, exp_precision12)
+
+### Clean
+for (i in 1:100) {
+  c12g0_pc_grns[[i]] <- arrange(c12g0_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(c12g0_gn_grns[[i]])) {
+    c12g0_gn_grns[[i]] <- arrange(c12g0_gn_grns[[i]], pval)
+  }
+}
+
+c12g0_pc_rankprec <- grns_to_rankprec(c12g0_pc_grns, true_grn12)
+c12g0_bc3_rankprec <- grns_to_rankprec(c12g0_bc3_grns, true_grn12)
+c12g0_gn_rankprec <- grns_to_rankprec(c12g0_gn_grns, true_grn12)
+c12g0_genie_rankprec <- grns_to_rankprec(c12g0_genie_grns, true_grn12)
+
+plot_rankprec(c12g0_pc_rankprec, c12g0_bc3_rankprec, c12g0_gn_rankprec, c12g0_genie_rankprec, exp_precision12)
+```
+
+## 200 Plants
+
+
+```{r}
+### Reading data ###
+####################
+true_grn12 <- read_grn('SERGIO/data_sets/De-noised_1200G_9T_300cPerT_6_DS3/Interaction_cID_6.txt', 1200)
+
+load_rdata('inference_output/1200g/200c')
+```
+
+
+```{r}
+### Extracting edges from results ###
+#####################################
+c12g2_pc_grns <- inf_to_grns(c12g2_pc)
+c12g2_bc3_grns <- inf_to_grns(c12g2_bc3)
+c12g2_gn_grns <- inf_to_grns(c12g2_gn)
+c12g2_genie_grns <- inf_to_grns(c12g2_genie, size=nrow(true_grn12))
+#c12g_genie_grns_all <- inf_to_grns(c12g_genie)
+
+#Precision and recall
+c12g2_pc_stats <- grns_to_stats(c12g2_pc_grns, true_grn12)
+c12g2_bc3_stats <- grns_to_stats(c12g2_bc3_grns, true_grn12)
+c12g2_gn_stats <- grns_to_stats(c12g2_gn_grns, true_grn12)
+c12g2_genie_stats <- grns_to_stats(c12g2_genie_grns, true_grn12)
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+```
+```{r}
+d12g2_pc_grns <- inf_to_grns(d12g2_pc)
+d12g2_bc3_grns <- inf_to_grns(d12g2_bc3)
+d12g2_gn_grns <- inf_to_grns(d12g2_gn)
+d12g2_genie_grns <- inf_to_grns(d12g2_genie, size=nrow(true_grn12))
+# the amount of edges is less than half of all positives: nrow(true_grn12)
+
+#Precision and recall
+d12g2_pc_stats <- grns_to_stats(d12g2_pc_grns, true_grn12)
+d12g2_bc3_stats <- grns_to_stats(d12g2_bc3_grns, true_grn12)
+d12g2_gn_stats <- grns_to_stats(d12g2_gn_grns, true_grn12)
+d12g2_genie_stats <- grns_to_stats(d12g2_genie_grns, true_grn12)
+#dfs summarizing inferred grns to 4 stats, respectively precision, recall, true positives and proposed positives (TP + FP)
+```
+
+```{r}
+# Expected precision
+c12g2_merged_stats <- rbind(c12g2_pc_stats, c12g2_bc3_stats, c12g2_gn_stats, c12g2_genie_stats)
+d12g2_merged_stats <- rbind(d12g2_pc_stats, d12g2_bc3_stats, d12g2_gn_stats, d12g2_genie_stats)
+exp_precision12 <- nrow(true_grn12) / ((1200*1200 - 1200) / 2)
+
+# Precision
+plot1 <- ggplot(c12g2_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.1) +
+  ggtitle("Clean 1200 Genes 200 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision12, linetype="dashed", color="red")
+plot2 <- ggplot(d12g2_merged_stats, aes(x=method, y=prec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.1) +
+  ggtitle("Dirty 1200 Genes 200 Cells") +
+  xlab("Methods") + ylab("Precision") +
+  geom_hline(yintercept=exp_precision12, linetype="dashed", color="red")
+
+grid.arrange(plot1, plot2, ncol=2)
+
+# Recall
+plot_rec_1 <- ggplot(c4g2_merged_stats, aes(x=method, y=rec, fill=method)) +
+  geom_boxplot() + 
+  ylim(NA, 0.1) +
+  ggtitle("Clean 1200 Genes 200 Cells") +
+  xlab("Methods") + ylab("Recall")
+plot_rec_2 <- ggplot(d4g2_merged_stats, aes(x=method, y=rec, fill=method)) +
+  geom_boxplot() +
+  ylim(NA, 0.1) +
+  ggtitle("Dirty 1200 Genes 200 Cells") +
+  xlab("Methods") + ylab("Recall")
+  
+grid.arrange(plot_rec_1, plot_rec_2, ncol=2)
+
+# Expected precision
+d12g2_merged_summ <- d12g2_merged_stats %>%
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(d12g2_merged_summ, prec_diff = mean_precision - exp_precision12)
+
+c12g2_merged_summ <- c12g2_merged_stats %>% 
+  group_by(method) %>%
+  summarise(mean_precision=mean(prec), mean_recall=mean(rec)) 
+mutate(c12g2_merged_summ, prec_diff = mean_precision - exp_precision12)
+
+# PC significantly outperforming other methods.
+```
+```{r}
+exp_precision12 <- nrow(true_grn12) / ((1200*1200 - 1200) / 2)
+
+### Dirty
+for (i in 1:100) {
+  d12g2_pc_grns[[i]] <- arrange(d12g2_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(d12g2_gn_grns[[i]])) {
+    d12g2_gn_grns[[i]] <- arrange(d12g2_gn_grns[[i]], pval) # has a lot of similar values
+  }
+}
+
+d12g2_pc_rankprec <- grns_to_rankprec(d12g2_pc_grns, true_grn12)
+d12g2_bc3_rankprec <- grns_to_rankprec(d12g2_bc3_grns, true_grn12)
+d12g2_gn_rankprec <- grns_to_rankprec(d12g2_gn_grns, true_grn12)
+d12g2_genie_rankprec <- grns_to_rankprec(d12g2_genie_grns, true_grn12)
+
+plot_rankprec(d12g2_pc_rankprec, d12g2_bc3_rankprec, d12g2_gn_rankprec, d12g2_genie_rankprec, exp_precision12)
+
+### Clean
+for (i in 1:100) {
+  c12g2_pc_grns[[i]] <- arrange(c12g2_pc_grns[[i]], p) #not ordered by p-value/weight
+  if (!is.logical(c12g2_gn_grns[[i]])) {
+    c12g2_gn_grns[[i]] <- arrange(c12g2_gn_grns[[i]], pval)
+  }
+}
+
+c12g2_pc_rankprec <- grns_to_rankprec(c12g2_pc_grns, true_grn12)
+c12g2_bc3_rankprec <- grns_to_rankprec(c12g2_bc3_grns, true_grn12)
+c12g2_gn_rankprec <- grns_to_rankprec(c12g2_gn_grns, true_grn12)
+c12g2_genie_rankprec <- grns_to_rankprec(c12g2_genie_grns, true_grn12)
+
+plot_rankprec(c12g2_pc_rankprec, c12g2_bc3_rankprec, c12g2_gn_rankprec, c12g2_genie_rankprec, exp_precision12)
+```
+
+## 500 Plants
+
+## 1000 Plants
