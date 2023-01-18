@@ -1,0 +1,4 @@
+module load python/x86_64/3.8.0
+python Sergio.py $NSLOTS
+echo "Finished!"
+exit 0
